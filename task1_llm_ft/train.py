@@ -36,9 +36,26 @@ def l2_sp_penalty(model: torch.nn.Module, reference: dict[str, torch.Tensor]) ->
         if name not in reference:
             continue
         reference_value = reference[name].to(device=parameter.device, dtype=torch.float32)
-        term = (parameter.float() - reference_value).pow(2).sum()
+        term = 0.5 * (parameter.float() - reference_value).pow(2).sum()
         penalty = term if penalty is None else penalty + term
     return penalty if penalty is not None else torch.zeros((), device=next(model.parameters()).device)
+
+
+def add_l2_sp_gradients(
+    model: torch.nn.Module,
+    reference: dict[str, torch.Tensor],
+    coefficient: float,
+) -> None:
+    for name, parameter in model.named_parameters():
+        if name not in reference:
+            continue
+        reference_value = reference[name].to(device=parameter.device, dtype=torch.float32)
+        penalty_gradient = coefficient * (parameter.detach().float() - reference_value)
+        penalty_gradient = penalty_gradient.to(dtype=parameter.dtype)
+        if parameter.grad is None:
+            parameter.grad = penalty_gradient
+        else:
+            parameter.grad.add_(penalty_gradient)
 
 
 def shift_loss(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -279,10 +296,10 @@ def main() -> None:
             if config["l2_sp_lambda"]
             else torch.zeros((), device=device)
         )
-        if config["l2_sp_lambda"]:
-            scaler.scale(float(config["l2_sp_lambda"]) * penalty).backward()
         accumulated_penalty = penalty.detach()
         scaler.unscale_(optimizer)
+        if config["l2_sp_lambda"]:
+            add_l2_sp_gradients(model, reference, float(config["l2_sp_lambda"]))
         adapter_grad_max = max(
             (
                 parameter.grad.detach().abs().max().item()
