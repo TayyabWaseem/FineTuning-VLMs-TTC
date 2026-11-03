@@ -34,7 +34,13 @@ def load_model(
     device: str | torch.device | None = None,
 ) -> torch.nn.Module:
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-    if lora_rank:
+    checkpoint_path = Path(checkpoint) if checkpoint else None
+    has_merged_weights = bool(
+        checkpoint_path
+        and (checkpoint_path / "model.safetensors").exists()
+        and not (checkpoint_path / "adapter_model.safetensors").exists()
+    )
+    if lora_rank and not has_merged_weights:
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=dtype, trust_remote_code=True
         )
@@ -51,7 +57,7 @@ def load_model(
                 )
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            checkpoint or model_name,
+            checkpoint if has_merged_weights or not lora_rank else model_name,
             torch_dtype=dtype,
             trust_remote_code=True,
         )
