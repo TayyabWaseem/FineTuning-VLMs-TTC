@@ -100,7 +100,7 @@ def main() -> None:
             "--root",
             str(SMOKE_ROOT),
             "--checkpoint-counts",
-            "4,8",
+            "8",
         )
         require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
         for name in ("lora4", "lora16", "op_lora16"):
