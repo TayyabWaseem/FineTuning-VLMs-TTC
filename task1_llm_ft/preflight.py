@@ -29,8 +29,17 @@ def main() -> None:
         raise RuntimeError("CUDA is unavailable. Enable a Kaggle GPU accelerator.")
     free, total = torch.cuda.mem_get_info()
     disk = shutil.disk_usage(ROOT)
-    if disk.free < 20 * 1024**3:
-        raise RuntimeError(f"Less than 20 GiB free disk space: {disk.free / 2**30:.1f} GiB")
+    free_disk_gib = disk.free / 2**30
+    print(f"Available disk space: {free_disk_gib:.2f} GiB")
+    if free_disk_gib < 10:
+        raise RuntimeError(
+            f"Less than 10 GiB free disk space: {free_disk_gib:.1f} GiB"
+        )
+    if free_disk_gib < 20:
+        print(
+            f"WARNING: only {free_disk_gib:.1f} GiB free disk space; "
+            "the full run may fail while saving checkpoints."
+        )
     configs = sorted(CONFIG_DIR.glob("*.yaml"))
     if not args.smoke and len(configs) != 5:
         raise RuntimeError(f"Expected five Task 1 configs, found {len(configs)}")
@@ -65,7 +74,7 @@ def main() -> None:
         "gpu": torch.cuda.get_device_name(0),
         "gpu_free_gib": round(free / 2**30, 2),
         "gpu_total_gib": round(total / 2**30, 2),
-        "disk_free_gib": round(disk.free / 2**30, 2),
+        "disk_free_gib": round(free_disk_gib, 2),
         "target_modules": TARGET_MODULES,
         "mode": "smoke" if args.smoke else "full",
         "configs": [path.name for path in configs],
