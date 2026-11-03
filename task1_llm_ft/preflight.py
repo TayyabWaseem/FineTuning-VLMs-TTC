@@ -66,9 +66,19 @@ def main() -> None:
             raise RuntimeError(f"{path.name} does not use the required example count")
         if not args.smoke and config["save_example_counts"] != [9984, 20000, 29984, 40000]:
             raise RuntimeError(f"{path.name} has incorrect checkpoint boundaries")
-    groups = yaml.safe_load(PROMPTS.read_text(encoding="utf-8"))
-    if len(groups) != 8 or any(len(group.get("formats", {})) != 3 for group in groups):
-        raise RuntimeError("first_plot_questions.yaml must contain 8 questions × 3 formats")
+    prompts = yaml.safe_load(PROMPTS.read_text(encoding="utf-8"))
+    if not isinstance(prompts, list) or len(prompts) != 24:
+        raise RuntimeError("first_plot_questions.yaml must contain 24 prompt entries")
+    prompt_ids = [str(prompt.get("id", "")) for prompt in prompts]
+    if (
+        any(not prompt.get("paraphrases") for prompt in prompts)
+        or len({prompt_id.removesuffix("_json").removesuffix("_template") for prompt_id in prompt_ids}) != 8
+        or sum(prompt_id.endswith("_json") for prompt_id in prompt_ids) != 8
+        or sum(prompt_id.endswith("_template") for prompt_id in prompt_ids) != 8
+    ):
+        raise RuntimeError(
+            "first_plot_questions.yaml must contain 8 base, 8 JSON, and 8 template prompts"
+        )
     print(json.dumps({
         "status": "pass",
         "gpu": torch.cuda.get_device_name(0),
@@ -78,7 +88,7 @@ def main() -> None:
         "target_modules": TARGET_MODULES,
         "mode": "smoke" if args.smoke else "full",
         "configs": [path.name for path in configs],
-        "qualitative_prompts": len(groups) * 3,
+        "qualitative_prompts": len(prompts),
     }, indent=2))
 
 

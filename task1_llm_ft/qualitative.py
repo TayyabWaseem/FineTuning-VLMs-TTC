@@ -27,8 +27,12 @@ def generate(
     device = next(model.parameters()).device
     outputs = []
     for item in prompts:
+        messages = []
+        if item.get("system"):
+            messages.append({"role": "system", "content": item["system"]})
+        messages.append({"role": "user", "content": item["prompt"]})
         rendered = tokenizer.apply_chat_template(
-            [{"role": "user", "content": item["prompt"]}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
@@ -61,11 +65,21 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
     with open(args.prompts, encoding="utf-8") as handle:
-        question_groups = yaml.safe_load(handle)
+        prompt_entries = yaml.safe_load(handle)
     prompts = [
-        {"question_id": group["id"], "format": fmt, "prompt": prompt}
-        for group in question_groups
-        for fmt, prompt in group["formats"].items()
+        {
+            "question_id": entry["id"],
+            "format": (
+                "json"
+                if entry["id"].endswith("_json")
+                else "template"
+                if entry["id"].endswith("_template")
+                else "plain"
+            ),
+            "prompt": entry["paraphrases"][0],
+            "system": entry.get("system"),
+        }
+        for entry in prompt_entries
     ]
     if args.limit is not None:
         prompts = prompts[: args.limit]
