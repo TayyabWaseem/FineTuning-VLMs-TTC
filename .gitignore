@@ -1,2 +1,4 @@
 *.md
 *.ipynb
+__pycache__/
+*.py[cod]
