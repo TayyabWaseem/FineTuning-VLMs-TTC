@@ -156,8 +156,12 @@ def main() -> None:
         trust_remote_code=True,
     )
     if config["gradient_checkpointing"]:
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
 
     reference_model = model
     if args.resume and float(config["l2_sp_lambda"]) > 0:
@@ -189,7 +193,18 @@ def main() -> None:
     else:
         for parameter in model.parameters():
             parameter.requires_grad_(True)
+    if config["gradient_checkpointing"] and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
     model.to(device)
+    adapter_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and ("lora_A" in name or "lora_B" in name)
+    ]
+    initial_adapter = {
+        name: parameter.detach().float().cpu().clone()
+        for name, parameter in adapter_parameters
+    }
 
     dataset = select_metamath_examples(
         config["dataset_name"], tokenizer, int(config["max_length"]), int(config["num_examples"])
@@ -235,28 +250,30 @@ def main() -> None:
     data_iterator = iter(loader)
     for _ in range(examples_seen // int(config["micro_batch_size"])):
         next(data_iterator)
-    accumulated_tokens = 0
-    accumulated_sft_sum = 0.0
-    accumulated_penalty = torch.zeros((), device=device)
     while update < updates:
-        try:
-            batch = next(data_iterator)
-        except StopIteration:
-            data_iterator = iter(loader)
-            batch = next(data_iterator)
-        batch = {key: value.to(device) for key, value in batch.items()}
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"):
-            outputs = model(**batch)
-            sft_sum, valid_tokens = shift_loss(outputs.logits, batch["labels"])
-        scaler.scale(sft_sum).backward()
-        accumulated_tokens += valid_tokens
-        accumulated_sft_sum += sft_sum.detach().float().item()
-        is_update_boundary = (examples_seen + int(config["micro_batch_size"])) % (
-            int(config["micro_batch_size"]) * accumulation
-        ) == 0
-        examples_seen += int(config["micro_batch_size"])
-        if not is_update_boundary:
-            continue
+        microbatches = []
+        total_tokens = 0
+        for _ in range(accumulation):
+            try:
+                batch = next(data_iterator)
+            except StopIteration:
+                data_iterator = iter(loader)
+                batch = next(data_iterator)
+            batch = {key: value.to(device) for key, value in batch.items()}
+            total_tokens += int((batch["labels"][:, 1:] != -100).sum().item())
+            microbatches.append(batch)
+            examples_seen += int(config["micro_batch_size"])
+
+        accumulated_sft_sum = 0.0
+        for batch in microbatches:
+            with torch.autocast(
+                device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"
+            ):
+                outputs = model(**batch)
+                sft_sum, _ = shift_loss(outputs.logits, batch["labels"])
+            scaler.scale(sft_sum / max(1, total_tokens)).backward()
+            accumulated_sft_sum += sft_sum.detach().float().item()
+
         penalty = (
             l2_sp_penalty(model, reference)
             if config["l2_sp_lambda"]
@@ -266,9 +283,17 @@ def main() -> None:
             scaler.scale(float(config["l2_sp_lambda"]) * penalty).backward()
         accumulated_penalty = penalty.detach()
         scaler.unscale_(optimizer)
-        for parameter in model.parameters():
-            if parameter.grad is not None:
-                parameter.grad.div_(max(1, accumulated_tokens))
+        adapter_grad_max = max(
+            (
+                parameter.grad.detach().abs().max().item()
+                for _, parameter in adapter_parameters
+                if parameter.grad is not None
+            ),
+            default=0.0,
+        )
+        adapter_grad_count = sum(
+            parameter.grad is not None for _, parameter in adapter_parameters
+        )
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
         current_lr = cosine_lr(update, updates, int(config["warmup_updates"]), float(config["learning_rate"]))
         for group in optimizer.param_groups:
@@ -283,23 +308,23 @@ def main() -> None:
             {
                 "update": update,
                 "examples_seen": examples_seen,
-                "sft_loss": accumulated_sft_sum / max(1, accumulated_tokens),
+                "sft_loss": accumulated_sft_sum / max(1, total_tokens),
                 "l2_sp_omega": accumulated_penalty.float().item(),
                 "l2_sp_term": float(config["l2_sp_lambda"]) * accumulated_penalty.float().item(),
-                "total_loss": accumulated_sft_sum / max(1, accumulated_tokens)
+                "total_loss": accumulated_sft_sum / max(1, total_tokens)
                 + float(config["l2_sp_lambda"]) * accumulated_penalty.float().item(),
                 "learning_rate": current_lr,
                 "grad_norm": float(grad_norm),
                 "skipped_update": skipped,
+                "scaler_scale": old_scale,
+                "adapter_grad_count": adapter_grad_count,
+                "adapter_grad_max": adapter_grad_max,
             }
         )
         if examples_seen in save_counts:
             save_checkpoint(
                 model, tokenizer, optimizer, scaler, output_dir, examples_seen, update, config
             )
-        accumulated_tokens = 0
-        accumulated_sft_sum = 0.0
-        accumulated_penalty = torch.zeros((), device=device)
 
     elapsed = time.perf_counter() - started
     metadata = {
@@ -310,6 +335,15 @@ def main() -> None:
         "total_parameters": model_parameter_count(model),
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
         "adapter_stats": adapter_stats.__dict__ if adapter_stats else None,
+        "adapter_delta_frobenius_norm": (
+            sum(
+                (parameter.detach().float().cpu() - initial_adapter[name]).square().sum().item()
+                for name, parameter in adapter_parameters
+            )
+            ** 0.5
+            if adapter_parameters
+            else 0.0
+        ),
         "reference_storage_bytes": sum(value.numel() * value.element_size() for value in reference.values())
         if config["l2_sp_lambda"]
         else 0,
