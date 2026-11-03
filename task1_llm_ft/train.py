@@ -231,6 +231,19 @@ def main() -> None:
         config["dataset_name"], tokenizer, int(config["max_length"]), int(config["num_examples"])
     )
     train_dataset = CausalSFTDataset(dataset, tokenizer, int(config["max_length"]))
+    if str(config["method"]).startswith("smoke_") and train_dataset.items:
+        supervised = [
+            token
+            for token, label in zip(
+                train_dataset.items[0].input_ids, train_dataset.items[0].labels
+            )
+            if label != -100
+        ]
+        print(
+            "Supervised tokens example:",
+            tokenizer.decode(supervised, skip_special_tokens=False),
+            flush=True,
+        )
     # The assignment requires retained examples to remain in source order.
     sampler = SequentialSampler(train_dataset)
     loader = DataLoader(

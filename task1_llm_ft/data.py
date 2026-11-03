@@ -94,8 +94,19 @@ class CausalSFTDataset(TorchDataset[dict[str, torch.Tensor]]):
             full_ids = tokenizer(full, add_special_tokens=False)["input_ids"]
             if len(full_ids) > max_length:
                 raise ValueError("Selected example exceeded max_length after tokenization.")
-            prompt_len = min(len(prompt_ids), len(full_ids))
-            labels = [-100] * prompt_len + full_ids[prompt_len:]
+            if full_ids[: len(prompt_ids)] != prompt_ids:
+                raise RuntimeError("Prompt/full token alignment failed.")
+            prompt_len = len(prompt_ids)
+            im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+            end_positions = [
+                index for index, token_id in enumerate(full_ids[prompt_len:], start=prompt_len)
+                if token_id == im_end_id
+            ]
+            if not end_positions:
+                raise RuntimeError("Could not locate assistant end-of-turn token.")
+            supervised_end = end_positions[-1] + 1
+            labels = [-100] * len(full_ids)
+            labels[prompt_len:supervised_end] = full_ids[prompt_len:supervised_end]
             if len(labels) != len(full_ids):
                 raise RuntimeError("Prompt/response token alignment failed.")
             self.items.append(TokenizedExample(full_ids, labels))
