@@ -79,6 +79,15 @@ def main() -> None:
             str(SMOKE_ROOT / "full_ft/checkpoint-4"),
         )
         require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
+        for name in ("lora16", "op_lora16"):
+            run(
+                "task1_llm_ft/train.py",
+                "--config",
+                str(CONFIGS[name]),
+                "--resume",
+                str(SMOKE_ROOT / name / "checkpoint-4"),
+            )
+            require(SMOKE_ROOT / name / "checkpoint-8/training_state.pt")
 
         for name in ("lora4", "lora16", "op_lora16"):
             config = CONFIGS[name]
@@ -94,6 +103,13 @@ def main() -> None:
                 str(merged),
             )
             require(merged / "merge_verification.json")
+            verification = json.loads(
+                (merged / "merge_verification.json").read_text(encoding="utf-8")
+            )
+            if verification.get("adapter_delta_frobenius_norm", 0.0) <= 0.0:
+                raise RuntimeError(
+                    f"{name} adapter update is zero; smoke training did not move the adapter."
+                )
     else:
         run(
             "task1_llm_ft/verify_artifacts.py",
@@ -105,6 +121,15 @@ def main() -> None:
         require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
         for name in ("lora4", "lora16", "op_lora16"):
             require(SMOKE_ROOT / name / "merged/merge_verification.json")
+            verification = json.loads(
+                (SMOKE_ROOT / name / "merged/merge_verification.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if verification.get("adapter_delta_frobenius_norm", 0.0) <= 0.0:
+                raise RuntimeError(
+                    f"{name} adapter update is zero; rerun smoke training before continuing."
+                )
 
     evaluation_paths = {
         "baseline": "Qwen/Qwen3-0.6B",

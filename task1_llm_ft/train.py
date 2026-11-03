@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, SequentialSampler
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -180,16 +180,20 @@ def main() -> None:
         except TypeError:
             model.gradient_checkpointing_enable()
 
-    reference_model = model
-    if args.resume and float(config["l2_sp_lambda"]) > 0:
+    reference_model = None
+    if not is_adapter_run:
         reference_model = AutoModelForCausalLM.from_pretrained(
             config["model_name"], torch_dtype=torch.float32, trust_remote_code=True
         )
-    reference = {
-        name: parameter.detach().float().cpu().clone()
-        for name, parameter in reference_model.named_parameters()
-    }
-    if reference_model is not model:
+    reference = (
+        {
+            name: parameter.detach().float().cpu().clone()
+            for name, parameter in reference_model.named_parameters()
+        }
+        if reference_model is not None
+        else {}
+    )
+    if reference_model is not None:
         del reference_model
     adapter_stats = None
     if int(config["lora_rank"]) > 0:
