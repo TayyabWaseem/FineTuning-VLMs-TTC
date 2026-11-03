@@ -1,0 +1,22 @@
+method: full_ft
+model_name: Qwen/Qwen3-0.6B
+dataset_name: meta-math/MetaMathQA
+output_dir: results/task1/full_ft
+seed: 6304
+max_length: 2048
+num_examples: 40000
+micro_batch_size: 2
+gradient_accumulation_steps: 16
+num_updates: 1250
+warmup_updates: 38
+learning_rate: 2.0e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+gradient_checkpointing: true
+fp16: true
+l2_sp_lambda: 0.0
+lora_rank: 0
+lora_alpha: 0
+lora_dropout: 0.0
+op_lora_protection_rank: 0
+save_example_counts: [9984, 20000, 29984, 40000]

@@ -1,0 +1,11 @@
+# Kaggle supplies the CUDA-compatible PyTorch runtime.
+transformers>=4.51.0
+datasets>=3.3.0
+accelerate>=1.4.0
+peft>=0.14.0
+numpy>=2.1.0
+pandas>=2.2.0
+pyyaml>=6.0.2
+safetensors>=0.5.3
+lm-eval>=0.4.7
+math-verify>=0.7.0

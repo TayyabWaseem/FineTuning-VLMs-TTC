@@ -1,0 +1,22 @@
+method: smoke_lora4
+model_name: Qwen/Qwen3-0.6B
+dataset_name: meta-math/MetaMathQA
+output_dir: results/task1_smoke/lora4
+seed: 6304
+max_length: 512
+num_examples: 64
+micro_batch_size: 2
+gradient_accumulation_steps: 2
+num_updates: 2
+warmup_updates: 1
+learning_rate: 2.0e-4
+weight_decay: 0.01
+max_grad_norm: 1.0
+gradient_checkpointing: true
+fp16: true
+l2_sp_lambda: 0.0
+lora_rank: 4
+lora_alpha: 8
+lora_dropout: 0.05
+op_lora_protection_rank: 0
+save_example_counts: [4, 8, 64]
