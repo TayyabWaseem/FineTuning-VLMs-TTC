@@ -34,6 +34,10 @@ def json_default(value: Any) -> Any:
         return value.detach().cpu().tolist()
     if isinstance(value, np.generic):
         return value.item()
+    if callable(value):
+        module = getattr(value, "__module__", None)
+        name = getattr(value, "__qualname__", getattr(value, "__name__", type(value).__name__))
+        return f"{module}.{name}" if module else name
     raise TypeError(f"Cannot serialize {type(value)}")
 
 
