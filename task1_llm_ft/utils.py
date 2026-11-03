@@ -32,6 +32,8 @@ def json_default(value: Any) -> Any:
         return str(value)
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().tolist()
+    if isinstance(value, (torch.dtype, torch.device)):
+        return str(value)
     if isinstance(value, np.generic):
         return value.item()
     if callable(value):

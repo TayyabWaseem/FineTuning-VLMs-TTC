@@ -33,50 +33,78 @@ def require(path: Path) -> None:
         raise RuntimeError(f"Expected smoke-test artifact was not created: {path}")
 
 
+def valid_json(path: Path) -> bool:
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true", help="Keep previous smoke outputs.")
+    parser.add_argument(
+        "--continue",
+        dest="continue_run",
+        action="store_true",
+        help="Reuse completed training/merge artifacts and continue at evaluation.",
+    )
     args = parser.parse_args()
-    if not args.keep and SMOKE_ROOT.exists():
+    if args.continue_run and not SMOKE_ROOT.exists():
+        raise RuntimeError(f"Cannot continue; smoke output directory is missing: {SMOKE_ROOT}")
+    if not args.keep and not args.continue_run and SMOKE_ROOT.exists():
         shutil.rmtree(SMOKE_ROOT)
 
     run("-m", "task1_llm_ft.preflight", "--smoke")
-    for config in CONFIGS.values():
-        run("task1_llm_ft/train.py", "--config", str(config))
+    if not args.continue_run:
+        for config in CONFIGS.values():
+            run("task1_llm_ft/train.py", "--config", str(config))
 
-    run(
-        "task1_llm_ft/verify_artifacts.py",
-        "--root",
-        str(SMOKE_ROOT),
-        "--checkpoint-counts",
-        "4,8",
-    )
-
-    # Resume from the first optimizer checkpoint and verify that the second
-    # update can be recovered without changing the configured output location.
-    run(
-        "task1_llm_ft/train.py",
-        "--config",
-        str(CONFIGS["full_ft"]),
-        "--resume",
-        str(SMOKE_ROOT / "full_ft/checkpoint-4"),
-    )
-    require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
-
-    for name in ("lora4", "lora16", "op_lora16"):
-        config = CONFIGS[name]
-        checkpoint = SMOKE_ROOT / name / "checkpoint-8"
-        merged = SMOKE_ROOT / name / "merged"
         run(
-            "task1_llm_ft/merge_adapters.py",
-            "--config",
-            str(config),
-            "--checkpoint",
-            str(checkpoint),
-            "--output",
-            str(merged),
+            "task1_llm_ft/verify_artifacts.py",
+            "--root",
+            str(SMOKE_ROOT),
+            "--checkpoint-counts",
+            "4,8",
         )
-        require(merged / "merge_verification.json")
+
+        # Resume from the first optimizer checkpoint and verify that the second
+        # update can be recovered without changing the configured output location.
+        run(
+            "task1_llm_ft/train.py",
+            "--config",
+            str(CONFIGS["full_ft"]),
+            "--resume",
+            str(SMOKE_ROOT / "full_ft/checkpoint-4"),
+        )
+        require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
+
+        for name in ("lora4", "lora16", "op_lora16"):
+            config = CONFIGS[name]
+            checkpoint = SMOKE_ROOT / name / "checkpoint-8"
+            merged = SMOKE_ROOT / name / "merged"
+            run(
+                "task1_llm_ft/merge_adapters.py",
+                "--config",
+                str(config),
+                "--checkpoint",
+                str(checkpoint),
+                "--output",
+                str(merged),
+            )
+            require(merged / "merge_verification.json")
+    else:
+        run(
+            "task1_llm_ft/verify_artifacts.py",
+            "--root",
+            str(SMOKE_ROOT),
+            "--checkpoint-counts",
+            "4,8",
+        )
+        require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
+        for name in ("lora4", "lora16", "op_lora16"):
+            require(SMOKE_ROOT / name / "merged/merge_verification.json")
 
     evaluation_paths = {
         "baseline": "Qwen/Qwen3-0.6B",
@@ -87,19 +115,22 @@ def main() -> None:
         "op_lora16": str(SMOKE_ROOT / "op_lora16/merged"),
     }
     for name, model_path in evaluation_paths.items():
-        run(
-            "task1_llm_ft/evaluate.py",
-            "--model-path",
-            model_path,
-            "--output",
-            str(SMOKE_ROOT / f"eval_{name}.json"),
-            "--batch-size",
-            "1",
-            "--limit",
-            "1",
-        )
-        require(SMOKE_ROOT / f"eval_{name}.json")
-        require(SMOKE_ROOT / f"eval_{name}.samples.json")
+        output = SMOKE_ROOT / f"eval_{name}.json"
+        samples = SMOKE_ROOT / f"eval_{name}.samples.json"
+        if not (valid_json(output) and valid_json(samples)):
+            run(
+                "task1_llm_ft/evaluate.py",
+                "--model-path",
+                model_path,
+                "--output",
+                str(output),
+                "--batch-size",
+                "1",
+                "--limit",
+                "1",
+            )
+        require(output)
+        require(samples)
 
     qualitative_models = [
         f"baseline={CONFIGS['full_ft']}=Qwen/Qwen3-0.6B",
