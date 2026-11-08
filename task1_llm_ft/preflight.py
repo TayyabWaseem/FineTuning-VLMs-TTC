@@ -40,8 +40,10 @@ def main() -> None:
             f"WARNING: only {free_disk_gib:.1f} GiB free disk space; "
             "the full run may fail while saving checkpoints."
         )
-    configs = sorted(CONFIG_DIR.glob("*.yaml"))
-    if not args.smoke and len(configs) != 5:
+    configs = sorted(CONFIG_DIR.glob("smoke_*.yaml" if args.smoke else "*.yaml"))
+    if not args.smoke:
+        configs = [path for path in configs if not path.name.startswith("smoke_")]
+    if len(configs) != 5:
         raise RuntimeError(f"Expected five Task 1 configs, found {len(configs)}")
     if not PROMPTS.is_file():
         raise RuntimeError(f"Canonical prompt file not found: {PROMPTS}")

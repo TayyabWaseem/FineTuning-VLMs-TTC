@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +80,14 @@ def _prompt_texts(
     generator = torch.Generator().manual_seed(seed)
     gsm_indices = torch.randperm(len(gsm), generator=generator)[:n].tolist()
     hs_indices = torch.randperm(len(hs), generator=generator)[:n].tolist()
-    math = [gsm[i]["question"] for i in gsm_indices]
-    nonmath = [hs[i]["ctx"] for i in hs_indices]
+    # Match the zero-shot stock task prompts used in evaluate.py.
+    math = [f"Q: {gsm[i]['question']}\nA:" for i in gsm_indices]
+    def hellaswag_query(item: dict[str, Any]) -> str:
+        context = item["ctx_a"] + " " + item["ctx_b"].capitalize()
+        text = (item["activity_label"] + ": " + context).strip()
+        text = text.replace(" [title]", ". ")
+        return re.sub(r"\[.*?\]", "", text)
+    nonmath = [hellaswag_query(hs[i]) for i in hs_indices]
     return math, nonmath, [str(i) for i in gsm_indices], [str(i) for i in hs_indices]
 
 
@@ -91,23 +98,33 @@ def activation_diagnostics(
     tokenizer: Any,
     prompts: list[str],
     layers: list[int],
+    chat_prompts: bool = False,
 ) -> list[dict[str, Any]]:
     device = next(model.parameters()).device
     rows: list[dict[str, Any]] = []
     for prompt in prompts:
-        encoded = tokenizer(prompt, return_tensors="pt").to(device)
+        rendered = (
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}], tokenize=False,
+                add_generation_prompt=True, enable_thinking=False,
+            ) if chat_prompts else prompt
+        )
+        encoded = tokenizer(rendered, return_tensors="pt", add_special_tokens=False).to(device)
+        captured: dict[int, torch.Tensor] = {}
+        handles = []
+        for layer in layers:
+            name, _, _ = _weight_delta(model, base, layer)
+            def hook(_module: torch.nn.Module, args: tuple[torch.Tensor, ...], layer_id: int = layer) -> None:
+                captured[layer_id] = args[0][:, -1, :].detach().float()
+            handles.append(base.get_submodule(name).register_forward_pre_hook(hook))
+        try:
+            base(**encoded, use_cache=False)
+        finally:
+            for handle in handles:
+                handle.remove()
         for layer in layers:
             name, w0, delta = _weight_delta(model, base, layer)
-            module = base.get_submodule(name)
-            captured: list[torch.Tensor] = []
-
-            def hook(_module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
-                captured.append(args[0][:, -1, :].detach().float())
-
-            handle = module.register_forward_pre_hook(hook)
-            base(**encoded, use_cache=False)
-            handle.remove()
-            z = captured[-1]
+            z = captured[layer]
             numerator = (delta.to(z.device) @ z.T).norm().item()
             denominator = (w0.to(z.device) @ z.T).norm().item()
             rows.append(
@@ -138,16 +155,17 @@ def main() -> None:
     base_config["lora_alpha"] = 0
     base_config["op_lora_protection_rank"] = 0
     base, _ = load_from_config(base_config, args.base_model or config["model_name"], device)
+    base.float().eval()
     layers = [0, 13, 27]
     math, nonmath, math_ids, nonmath_ids = _prompt_texts(args.seed)
     result = {
         "config": config,
         "checkpoint": args.checkpoint,
         "weight": weight_diagnostics(
-            model, base, layers, int(config.get("op_lora_protection_rank", 128))
+            model, base, layers, 128
         ),
         "activation": {
-            "math": activation_diagnostics(model, base, tokenizer, math, layers),
+            "math": activation_diagnostics(model, base, tokenizer, math, layers, chat_prompts=True),
             "non_math": activation_diagnostics(model, base, tokenizer, nonmath, layers),
         },
         "probe_ids": {"gsm8k": math_ids, "hellaswag": nonmath_ids},

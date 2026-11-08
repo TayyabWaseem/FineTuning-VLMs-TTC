@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from transformers import AutoModelForCausalLM
 
 try:
     from .modeling import compare_merged_unmerged_logits, load_from_config, merge_projected_adapters
@@ -24,8 +25,12 @@ def main() -> None:
     config = load_config(args.config)
     model, tokenizer = load_from_config(config, args.checkpoint, "cuda")
     merged_model, _ = load_from_config(config, args.checkpoint, "cuda")
+    baseline = AutoModelForCausalLM.from_pretrained(
+        config["model_name"], torch_dtype=torch.float16, trust_remote_code=True
+    ).to("cuda")
     probe = tokenizer("Verification prompt.", return_tensors="pt").to("cuda")
     model.eval()
+    baseline.eval()
     expected_weights = {}
     adapter_delta_max = 0.0
     adapter_delta_norm = 0.0
@@ -37,6 +42,15 @@ def main() -> None:
             adapter_delta_norm += delta.square().sum().item()
     merged_model = merge_projected_adapters(merged_model)
     verification = compare_merged_unmerged_logits(model, merged_model, probe)
+    with torch.no_grad():
+        adapter_logits = model(**probe).logits.float()
+        baseline_logits = baseline(**probe).logits.float()
+    adapter_difference = (adapter_logits - baseline_logits).abs()
+    verification["adapter_vs_baseline_max_absolute"] = adapter_difference.max().item()
+    if verification["adapter_vs_baseline_max_absolute"] <= 0.0:
+        raise RuntimeError(
+            "Adapter logits exactly match the baseline; the adapter update is zero."
+        )
     weight_error_max = 0.0
     weight_error_sum = 0.0
     weight_error_count = 0

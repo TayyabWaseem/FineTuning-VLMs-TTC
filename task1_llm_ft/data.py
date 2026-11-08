@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 import torch
@@ -39,29 +42,56 @@ def select_metamath_examples(
     tokenizer: Any,
     max_length: int,
     num_examples: int,
+    manifest_path: str | Path | None = None,
 ) -> Dataset:
     source = load_dataset(dataset_name, split="train")
     gsm_questions = load_gsm8k_questions()
     selected: list[dict[str, str]] = []
-    for example in source:
+    counts = {"empty": 0, "gsm8k_overlap": 0, "overlength": 0}
+    manifest = []
+    for source_index, example in enumerate(source):
         question = _field(example, "query", "question")
         response = _field(example, "response", "answer")
         original = _field(example, "original_question")
         if not question.strip() or not response.strip():
+            counts["empty"] += 1
             continue
         if normalize_text(question) in gsm_questions or normalize_text(original) in gsm_questions:
+            counts["gsm8k_overlap"] += 1
             continue
         messages = [{"role": "user", "content": question}, {"role": "assistant", "content": response}]
         rendered = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, enable_thinking=False
         )
-        if len(tokenizer(rendered, add_special_tokens=False)["input_ids"]) > max_length:
+        token_count = len(tokenizer(rendered, add_special_tokens=False)["input_ids"])
+        if token_count > max_length:
+            counts["overlength"] += 1
             continue
         selected.append({"question": question, "response": response})
+        manifest.append({
+            "source_index": source_index,
+            "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+            "formatted_tokens": token_count,
+        })
         if len(selected) == num_examples:
             break
     if len(selected) != num_examples:
         raise RuntimeError(f"Only found {len(selected)} eligible examples; required {num_examples}.")
+    if manifest_path is not None:
+        path = Path(manifest_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "dataset": dataset_name,
+            "selected_count": len(selected),
+            "source_rows_examined": manifest[-1]["source_index"] + 1,
+            "exclusion_counts": counts,
+            "first_selected": manifest[0],
+            "last_selected": manifest[-1],
+            "selection_sha256": hashlib.sha256(
+                json.dumps(manifest, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "selected": manifest,
+        }, indent=2), encoding="utf-8")
     return Dataset.from_list(selected)
 
 

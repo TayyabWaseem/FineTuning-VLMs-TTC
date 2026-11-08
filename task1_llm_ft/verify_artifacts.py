@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 
@@ -21,11 +22,15 @@ def main() -> None:
     missing: list[str] = []
     for method in methods:
         output = root / method
+        index_path = output / "remote_checkpoints.json"
+        remote_index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
         for name in ["train.jsonl", "metadata.json", "run_config.json"]:
             if not (output / name).is_file():
                 missing.append(str(output / name))
         for checkpoint in required_checkpoints:
             path = output / checkpoint
+            if remote_index.get(checkpoint, {}).get("verified"):
+                continue
             for name in ["run_config.json", "training_state.pt"]:
                 if not (path / name).is_file():
                     missing.append(str(path / name))

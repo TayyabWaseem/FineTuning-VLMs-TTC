@@ -44,7 +44,10 @@ def load_model(
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=dtype, trust_remote_code=True
         )
-        add_lora(model, lora_rank, lora_alpha, lora_dropout, protection_rank)
+        if device is not None:
+            model.to(device)
+        add_lora(model, lora_rank, lora_alpha, lora_dropout, protection_rank,
+                 initialize_protection=not bool(checkpoint))
         if checkpoint:
             state_path = Path(checkpoint) / "adapter_model.safetensors"
             if not state_path.exists():
@@ -55,6 +58,11 @@ def load_model(
                 raise RuntimeError(
                     f"Unexpected adapter checkpoint keys: {incompatible.unexpected_keys[:5]}"
                 )
+            if protection_rank and any(
+                key.endswith(("u_protected", "v_protected"))
+                for key in incompatible.missing_keys
+            ):
+                raise RuntimeError("OPLoRA checkpoint is missing its FP32 protected bases")
     else:
         model = AutoModelForCausalLM.from_pretrained(
             checkpoint if has_merged_weights or not lora_rank else model_name,

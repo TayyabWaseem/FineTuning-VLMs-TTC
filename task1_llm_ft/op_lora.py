@@ -90,6 +90,7 @@ def add_lora(
     alpha: int,
     dropout: float,
     protection_rank: int = 0,
+    initialize_protection: bool = True,
 ) -> AdapterStats:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -106,7 +107,13 @@ def add_lora(
             original, rank, alpha, dropout, protection_rank=protection_rank
         )
         if protection_rank > 0:
-            replacement.initialize_protection(protection_rank)
+            if initialize_protection:
+                replacement.initialize_protection(protection_rank)
+            else:
+                k = min(protection_rank, original.out_features, original.in_features)
+                replacement.u_protected = torch.empty(original.out_features, k, dtype=torch.float32, device=original.weight.device)
+                replacement.v_protected = torch.empty(original.in_features, k, dtype=torch.float32, device=original.weight.device)
+                replacement.protection_rank = k
             basis_parameters += replacement.u_protected.numel() + replacement.v_protected.numel()
         _replace_named_linear(model, path, replacement)
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)

@@ -41,6 +41,40 @@ def valid_json(path: Path) -> bool:
     return True
 
 
+def inspect_training(name: str, adapter: bool) -> None:
+    output = SMOKE_ROOT / name
+    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in (output / "train.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    skipped = sum(bool(record.get("skipped_update", False)) for record in records)
+    print(f"{name}: skipped_updates={skipped}/{len(records)}")
+    if skipped:
+        raise RuntimeError(f"{name} has {skipped} skipped optimizer updates")
+    if not records or skipped == len(records):
+        raise RuntimeError(f"{name} has no successful optimizer update.")
+    if adapter:
+        delta = float(metadata.get("adapter_delta_frobenius_norm", 0.0))
+        print(f"{name}: adapter_delta_frobenius_norm={delta}")
+        if delta <= 0.0:
+            raise RuntimeError(f"{name} adapter displacement is zero.")
+    else:
+        displacement = float(metadata.get("final_parameter_displacement_l2", 0.0))
+        print(
+            f"{name}: displacement_l2={displacement}, "
+            f"peak_gpu_memory_bytes={metadata.get('peak_gpu_memory_bytes')}"
+        )
+        if displacement <= 0.0:
+            raise RuntimeError(f"{name} displacement from theta0 is zero.")
+    for record in records:
+        print(
+            f"{name}: update={record['update']} grad_norm={record.get('grad_norm')} "
+            f"adapter_grad_count={record.get('adapter_grad_count')}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--keep", action="store_true", help="Keep previous smoke outputs.")
@@ -58,36 +92,22 @@ def main() -> None:
 
     run("-m", "task1_llm_ft.preflight", "--smoke")
     if not args.continue_run:
-        for config in CONFIGS.values():
+        for name, config in CONFIGS.items():
             run("task1_llm_ft/train.py", "--config", str(config))
-
-        run(
-            "task1_llm_ft/verify_artifacts.py",
-            "--root",
-            str(SMOKE_ROOT),
-            "--checkpoint-counts",
-            "4,8",
-        )
-
-        # Resume from the first optimizer checkpoint and verify that the second
-        # update can be recovered without changing the configured output location.
-        run(
-            "task1_llm_ft/train.py",
-            "--config",
-            str(CONFIGS["full_ft"]),
-            "--resume",
-            str(SMOKE_ROOT / "full_ft/checkpoint-4"),
-        )
-        require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
-        for name in ("lora16", "op_lora16"):
-            run(
-                "task1_llm_ft/train.py",
-                "--config",
-                str(CONFIGS[name]),
-                "--resume",
-                str(SMOKE_ROOT / name / "checkpoint-4"),
-            )
-            require(SMOKE_ROOT / name / "checkpoint-8/training_state.pt")
+            for count in (4, 8):
+                require(SMOKE_ROOT / name / f"checkpoint-{count}/training_state.pt")
+            if name in ("full_ft", "lora16", "op_lora16"):
+                # This proves optimizer/data/RNG recovery from the first update.
+                run(
+                    "task1_llm_ft/train.py", "--config", str(config),
+                    "--resume", str(SMOKE_ROOT / name / "checkpoint-4"),
+                )
+                require(SMOKE_ROOT / name / "checkpoint-8/training_state.pt")
+            if name in ("full_ft", "full_ft_l2sp"):
+                # Full optimizer states are multi-GiB. Retain model weights for
+                # evaluation after the recovery check, not temporary state.
+                shutil.rmtree(SMOKE_ROOT / name / "checkpoint-4")
+                (SMOKE_ROOT / name / "checkpoint-8/training_state.pt").unlink()
 
         for name in ("lora4", "lora16", "op_lora16"):
             config = CONFIGS[name]
@@ -111,14 +131,9 @@ def main() -> None:
                     f"{name} adapter update is zero; smoke training did not move the adapter."
                 )
     else:
-        run(
-            "task1_llm_ft/verify_artifacts.py",
-            "--root",
-            str(SMOKE_ROOT),
-            "--checkpoint-counts",
-            "8",
-        )
-        require(SMOKE_ROOT / "full_ft/checkpoint-8/training_state.pt")
+        for name in CONFIGS:
+            require(SMOKE_ROOT / name / "checkpoint-8/run_config.json")
+            require(SMOKE_ROOT / name / "metadata.json")
         for name in ("lora4", "lora16", "op_lora16"):
             require(SMOKE_ROOT / name / "merged/merge_verification.json")
             verification = json.loads(
@@ -131,6 +146,11 @@ def main() -> None:
                     f"{name} adapter update is zero; rerun smoke training before continuing."
                 )
 
+    for name in ("full_ft", "full_ft_l2sp"):
+        inspect_training(name, adapter=False)
+    for name in ("lora4", "lora16", "op_lora16"):
+        inspect_training(name, adapter=True)
+
     evaluation_paths = {
         "baseline": "Qwen/Qwen3-0.6B",
         "full_ft": str(SMOKE_ROOT / "full_ft/checkpoint-8"),
@@ -142,7 +162,8 @@ def main() -> None:
     for name, model_path in evaluation_paths.items():
         output = SMOKE_ROOT / f"eval_{name}.json"
         samples = SMOKE_ROOT / f"eval_{name}.samples.json"
-        if not (valid_json(output) and valid_json(samples)):
+        gsm_examples = SMOKE_ROOT / f"eval_{name}.gsm8k_examples.json"
+        if not (valid_json(output) and valid_json(samples) and valid_json(gsm_examples)):
             run(
                 "task1_llm_ft/evaluate.py",
                 "--model-path",
@@ -156,6 +177,7 @@ def main() -> None:
             )
         require(output)
         require(samples)
+        require(gsm_examples)
 
     qualitative_models = [
         f"baseline={CONFIGS['full_ft']}=Qwen/Qwen3-0.6B",

@@ -34,7 +34,7 @@ def benchmark_table(result_files: list[tuple[str, str]], output: str) -> None:
     baseline_values: dict[str, float] = {}
     loaded = [(condition, load_json(path)) for condition, path in result_files]
     primary = {
-        "gsm8k_cot": "exact_match",
+        "gsm8k_cot": "exact_match,flexible-extract",
         "hellaswag": "acc_norm,none",
         "boolq": "acc,none",
         "arc_easy": "acc_norm,none",
@@ -42,19 +42,21 @@ def benchmark_table(result_files: list[tuple[str, str]], output: str) -> None:
     baseline_result = next((result for condition, result in loaded if condition == "baseline"), loaded[0][1])
     for task, metrics in baseline_result.get("results", {}).items():
         key = primary.get(task)
-        if key in metrics:
-            baseline_values[task] = float(metrics[key])
+        if key not in metrics:
+            raise RuntimeError(f"Baseline is missing primary metric {task}/{key}: {sorted(metrics)}")
+        baseline_values[task] = float(metrics[key])
     for condition, result in loaded:
         for task, metrics in result.get("results", {}).items():
             row = {"condition": condition, "task": task}
             row.update(metrics)
             metric = primary.get(task)
-            if metric in metrics:
-                row["primary_metric"] = metric
-                row["primary_score"] = float(metrics[metric])
-                row["change_from_baseline_pp"] = 100.0 * (
-                    float(metrics[metric]) - baseline_values.get(task, float(metrics[metric]))
-                )
+            if metric not in metrics:
+                raise RuntimeError(f"{condition} is missing primary metric {task}/{metric}")
+            row["primary_metric"] = metric
+            row["primary_score"] = float(metrics[metric])
+            row["change_from_baseline_pp"] = 100.0 * (
+                float(metrics[metric]) - baseline_values[task]
+            )
             rows.append(row)
     pd.DataFrame(rows).to_csv(output, index=False)
 

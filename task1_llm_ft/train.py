@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import random
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
+import numpy as np
 import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from torch.amp import GradScaler
@@ -16,20 +19,23 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from .data import CausalSFTDataset, SFTCollator, select_metamath_examples
-    from .op_lora import add_lora, export_projected_adapters
+    from .op_lora import ProjectedLoRALinear, add_lora, export_projected_adapters
+    from .remote import sync_artifact, sync_checkpoint
     from .utils import (
         JsonlLogger, cosine_lr, load_config, model_parameter_count,
         parameter_groups, seed_everything, write_json,
     )
 except ImportError:
     from data import CausalSFTDataset, SFTCollator, select_metamath_examples
-    from op_lora import add_lora, export_projected_adapters
+    from op_lora import ProjectedLoRALinear, add_lora, export_projected_adapters
+    from remote import sync_artifact, sync_checkpoint
     from utils import (
         JsonlLogger, cosine_lr, load_config, model_parameter_count,
         parameter_groups, seed_everything, write_json,
     )
 
 
+@torch.no_grad()
 def l2_sp_penalty(model: torch.nn.Module, reference: dict[str, torch.Tensor]) -> torch.Tensor:
     penalty = None
     for name, parameter in model.named_parameters():
@@ -45,17 +51,21 @@ def add_l2_sp_gradients(
     model: torch.nn.Module,
     reference: dict[str, torch.Tensor],
     coefficient: float,
-) -> None:
+) -> torch.Tensor:
+    penalty = torch.zeros((), dtype=torch.float32, device=next(model.parameters()).device)
     for name, parameter in model.named_parameters():
         if name not in reference:
             continue
         reference_value = reference[name].to(device=parameter.device, dtype=torch.float32)
-        penalty_gradient = coefficient * (parameter.detach().float() - reference_value)
+        displacement = parameter.detach().float() - reference_value
+        penalty += 0.5 * displacement.square().sum()
+        penalty_gradient = coefficient * displacement
         penalty_gradient = penalty_gradient.to(dtype=parameter.dtype)
         if parameter.grad is None:
             parameter.grad = penalty_gradient
         else:
             parameter.grad.add_(penalty_gradient)
+    return penalty
 
 
 def shift_loss(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -95,6 +105,9 @@ def save_checkpoint(
     examples_seen: int,
     update: int,
     config: dict[str, Any],
+    adapter_stats: dict[str, Any] | None = None,
+    elapsed_seconds: float = 0.0,
+    peak_gpu_memory_bytes: int | None = None,
 ) -> None:
     checkpoint_dir = output_dir / f"checkpoint-{examples_seen}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -102,9 +115,10 @@ def save_checkpoint(
         model = model.module
     if int(config["lora_rank"]) > 0:
         adapter_state = {
-            name: parameter.detach().cpu()
-            for name, parameter in model.named_parameters()
-            if parameter.requires_grad
+            name: value.detach().cpu().contiguous()
+            for name, value in model.state_dict().items()
+            if name.endswith(("lora_A", "lora_B"))
+            or (name.endswith(("u_protected", "v_protected")) and value.numel() > 0)
         }
         save_file(adapter_state, str(checkpoint_dir / "adapter_model.safetensors"))
     else:
@@ -112,14 +126,26 @@ def save_checkpoint(
     tokenizer.save_pretrained(checkpoint_dir)
     if int(config["lora_rank"]) > 0:
         write_json(checkpoint_dir / "adapter_config.json", config)
+    rng_cpu = torch.get_rng_state()
+    rng_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    rng_python = random.getstate()
+    rng_numpy = np.random.get_state()
     torch.save(
         {
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
-            "rng_cpu": torch.get_rng_state(),
-            "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "rng_cpu": rng_cpu,
+            "rng_cuda": rng_cuda,
+            "rng_python": rng_python,
+            "rng_numpy": rng_numpy,
             "examples_seen": examples_seen,
             "update": update,
+            "adapter_stats": adapter_stats,
+            "elapsed_seconds": elapsed_seconds,
+            "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+            "selection_sha256": json.loads(
+                (output_dir / "selection_manifest.json").read_text(encoding="utf-8")
+            )["selection_sha256"],
             "scheduler": {
                 "type": "cosine",
                 "total_updates": int(config["num_updates"]),
@@ -142,6 +168,13 @@ def save_checkpoint(
             "checkpoint_size_bytes": directory_size(checkpoint_dir),
         },
     )
+    sync_checkpoint(checkpoint_dir, output_dir)
+    # Network clients may consume host RNGs. Match the saved recovery state.
+    torch.set_rng_state(rng_cpu)
+    if rng_cuda is not None:
+        torch.cuda.set_rng_state_all(rng_cuda)
+    random.setstate(rng_python)
+    np.random.set_state(rng_numpy)
 
 
 def main() -> None:
@@ -150,6 +183,10 @@ def main() -> None:
     parser.add_argument("--resume", default=None)
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.resume:
+        prior_config = json.loads((Path(args.resume) / "run_config.json").read_text(encoding="utf-8"))
+        if prior_config != config:
+            raise RuntimeError("Resume configuration differs from the recovery checkpoint")
     seed_everything(int(config["seed"]))
     output_dir = Path(config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -161,9 +198,10 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     is_adapter_run = int(config["lora_rank"]) > 0
+    needs_fp32_bases = bool(config["op_lora_protection_rank"]) and not args.resume
     model_dtype = (
         torch.float16
-        if is_adapter_run and device.type == "cuda"
+        if is_adapter_run and device.type == "cuda" and not needs_fp32_bases
         else torch.float32
     )
     model_source = args.resume if args.resume and not is_adapter_run else config["model_name"]
@@ -197,13 +235,21 @@ def main() -> None:
         del reference_model
     adapter_stats = None
     if int(config["lora_rank"]) > 0:
+        model.to(device)
         adapter_stats = add_lora(
             model,
             rank=int(config["lora_rank"]),
             alpha=int(config["lora_alpha"]),
             dropout=float(config["lora_dropout"]),
             protection_rank=int(config["op_lora_protection_rank"]),
+            initialize_protection=not bool(args.resume),
         )
+        if needs_fp32_bases and device.type == "cuda":
+            # The SVD used original FP32 weights. Freeze the resulting backbone
+            # in FP16 while preserving FP32 factors and protected bases.
+            for parameter in model.parameters():
+                if not parameter.requires_grad:
+                    parameter.data = parameter.data.to(dtype=torch.float16)
         if args.resume:
             state_path = Path(args.resume) / "adapter_model.safetensors"
             if not state_path.exists():
@@ -211,6 +257,11 @@ def main() -> None:
             incompatible = model.load_state_dict(load_file(str(state_path), device="cpu"), strict=False)
             if incompatible.unexpected_keys:
                 raise RuntimeError(f"Unexpected adapter keys: {incompatible.unexpected_keys[:5]}")
+            if config["op_lora_protection_rank"] and any(
+                key.endswith(("u_protected", "v_protected"))
+                for key in incompatible.missing_keys
+            ):
+                raise RuntimeError("OPLoRA recovery checkpoint is missing protected bases")
     else:
         for parameter in model.parameters():
             parameter.requires_grad_(True)
@@ -222,14 +273,22 @@ def main() -> None:
         for name, parameter in model.named_parameters()
         if parameter.requires_grad and ("lora_A" in name or "lora_B" in name)
     ]
-    initial_adapter = {
-        name: parameter.detach().float().cpu().clone()
-        for name, parameter in adapter_parameters
-    }
-
     dataset = select_metamath_examples(
-        config["dataset_name"], tokenizer, int(config["max_length"]), int(config["num_examples"])
+        config["dataset_name"], tokenizer, int(config["max_length"]),
+        int(config["num_examples"]), output_dir / "selection_manifest.json",
     )
+    if resume_state:
+        current_selection = json.loads((output_dir / "selection_manifest.json").read_text(encoding="utf-8"))["selection_sha256"]
+        if resume_state.get("selection_sha256") != current_selection:
+            raise RuntimeError("Resume selection differs from the recovery checkpoint")
+    reference_manifest = output_dir.parent / "full_ft" / "selection_manifest.json"
+    if config["method"] != "full_ft" and not str(config["method"]).startswith("smoke_"):
+        if not reference_manifest.exists():
+            raise RuntimeError("Full FT selection manifest is missing")
+        current_hash = json.loads((output_dir / "selection_manifest.json").read_text(encoding="utf-8"))["selection_sha256"]
+        reference_hash = json.loads(reference_manifest.read_text(encoding="utf-8"))["selection_sha256"]
+        if current_hash != reference_hash:
+            raise RuntimeError("MetaMathQA selection differs from the Full FT run")
     train_dataset = CausalSFTDataset(dataset, tokenizer, int(config["max_length"]))
     if str(config["method"]).startswith("smoke_") and train_dataset.items:
         supervised = [
@@ -259,7 +318,9 @@ def main() -> None:
         betas=(0.9, 0.999),
         eps=1e-8,
     )
-    scaler = GradScaler("cuda", enabled=device.type == "cuda")
+    # FP16 backbone gradients can overflow at the default 65536 scale before
+    # a two-step smoke run has enough updates to recover.
+    scaler = GradScaler("cuda", init_scale=1024.0, enabled=device.type == "cuda")
     resume_state = None
     if args.resume:
         resume_state = torch.load(
@@ -269,9 +330,15 @@ def main() -> None:
         )
         optimizer.load_state_dict(resume_state["optimizer"])
         scaler.load_state_dict(resume_state["scaler"])
-        torch.set_rng_state(resume_state["rng_cpu"])
-        if torch.cuda.is_available() and resume_state["rng_cuda"] is not None:
-            torch.cuda.set_rng_state_all(resume_state["rng_cuda"])
+        # Restore RNG after constructing/skipping the DataLoader iterator below;
+        # iterator construction itself consumes a Torch RNG draw.
+        log_path = output_dir / "train.jsonl"
+        if log_path.exists():
+            prior = [
+                line for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and int(json.loads(line)["update"]) <= int(resume_state["update"])
+            ]
+            log_path.write_text("\n".join(prior) + ("\n" if prior else ""), encoding="utf-8")
     logger = JsonlLogger(output_dir / "train.jsonl")
     updates = int(config["num_updates"])
     accumulation = int(config["gradient_accumulation_steps"])
@@ -281,9 +348,28 @@ def main() -> None:
     examples_seen = int(resume_state["examples_seen"]) if resume_state else 0
     update = int(resume_state["update"]) if resume_state else 0
     started = time.perf_counter()
+    previous_elapsed = float(resume_state.get("elapsed_seconds", 0.0)) if resume_state else 0.0
+    previous_peak = int(resume_state.get("peak_gpu_memory_bytes") or 0) if resume_state else 0
+    effective_adapter_stats = (
+        resume_state.get("adapter_stats") if resume_state and resume_state.get("adapter_stats")
+        else adapter_stats.__dict__ if adapter_stats else None
+    )
+    skipped_updates = sum(
+        bool(json.loads(line).get("skipped_update"))
+        for line in (output_dir / "train.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ) if resume_state else 0
     data_iterator = iter(loader)
     for _ in range(examples_seen // int(config["micro_batch_size"])):
         next(data_iterator)
+    if resume_state:
+        torch.set_rng_state(resume_state["rng_cpu"])
+        if torch.cuda.is_available() and resume_state["rng_cuda"] is not None:
+            torch.cuda.set_rng_state_all(resume_state["rng_cuda"])
+        if "rng_python" in resume_state:
+            random.setstate(resume_state["rng_python"])
+        if "rng_numpy" in resume_state:
+            np.random.set_state(resume_state["rng_numpy"])
     while update < updates:
         microbatches = []
         total_tokens = 0
@@ -308,15 +394,12 @@ def main() -> None:
             scaler.scale(sft_sum / max(1, total_tokens)).backward()
             accumulated_sft_sum += sft_sum.detach().float().item()
 
+        scaler.unscale_(optimizer)
         penalty = (
-            l2_sp_penalty(model, reference)
-            if config["l2_sp_lambda"]
-            else torch.zeros((), device=device)
+            add_l2_sp_gradients(model, reference, float(config["l2_sp_lambda"]))
+            if config["l2_sp_lambda"] else torch.zeros((), device=device)
         )
         accumulated_penalty = penalty.detach()
-        scaler.unscale_(optimizer)
-        if config["l2_sp_lambda"]:
-            add_l2_sp_gradients(model, reference, float(config["l2_sp_lambda"]))
         adapter_grad_max = max(
             (
                 parameter.grad.detach().abs().max().item()
@@ -336,6 +419,7 @@ def main() -> None:
         scaler.step(optimizer)
         scaler.update()
         skipped = scaler.get_scale() < old_scale
+        skipped_updates += int(skipped)
         optimizer.zero_grad(set_to_none=True)
         update += 1
         logger.write(
@@ -355,28 +439,40 @@ def main() -> None:
                 "adapter_grad_max": adapter_grad_max,
             }
         )
+        if skipped:
+            raise RuntimeError(
+                f"FP16 scaler skipped optimizer update {update} after {examples_seen} examples; "
+                "stopping so the prescribed 1,250 successful updates are not silently reduced. "
+                "Inspect train.jsonl and restart from the last recovery checkpoint after fixing the scale."
+            )
         if examples_seen in save_counts:
+            if is_adapter_run and not any(
+                module.delta_weight().detach().abs().max().item() > 0
+                for module in model.modules() if isinstance(module, ProjectedLoRALinear)
+            ):
+                raise RuntimeError(f"Adapter correction is still zero at checkpoint {examples_seen}")
             save_checkpoint(
-                model, tokenizer, optimizer, scaler, output_dir, examples_seen, update, config
+                model, tokenizer, optimizer, scaler, output_dir, examples_seen, update, config,
+                effective_adapter_stats,
+                previous_elapsed + time.perf_counter() - started,
+                max(previous_peak, torch.cuda.max_memory_allocated()) if device.type == "cuda" else None,
             )
 
-    elapsed = time.perf_counter() - started
+    elapsed = previous_elapsed + time.perf_counter() - started
     metadata = {
         "method": config["method"],
         "device": str(device),
         "training_seconds": elapsed,
         "trainable_parameters": model_parameter_count(model, trainable_only=True),
         "total_parameters": model_parameter_count(model),
-        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
-        "adapter_stats": adapter_stats.__dict__ if adapter_stats else None,
+        "peak_gpu_memory_bytes": max(previous_peak, torch.cuda.max_memory_allocated()) if device.type == "cuda" else None,
+        "skipped_updates": skipped_updates,
+        "adapter_stats": effective_adapter_stats,
         "adapter_delta_frobenius_norm": (
             sum(
-                (parameter.detach().float().cpu() - initial_adapter[name]).square().sum().item()
-                for name, parameter in adapter_parameters
-            )
-            ** 0.5
-            if adapter_parameters
-            else 0.0
+                module.delta_weight().detach().float().square().sum().item()
+                for module in model.modules() if isinstance(module, ProjectedLoRALinear)
+            ) ** 0.5 if adapter_parameters else 0.0
         ),
         "reference_storage_bytes": sum(value.numel() * value.element_size() for value in reference.values())
         if config["l2_sp_lambda"]
@@ -389,10 +485,21 @@ def main() -> None:
             for path in output_dir.glob("checkpoint-*")
             if path.is_dir()
         },
+        "remote_checkpoint_sizes_bytes": {
+            name: details["size_bytes"]
+            for name, details in json.loads((output_dir / "remote_checkpoints.json").read_text(encoding="utf-8")).items()
+        } if (output_dir / "remote_checkpoints.json").exists() else {},
     }
     if adapter_stats:
         torch.save(export_projected_adapters(model), output_dir / "projected_adapters.pt")
+        sync_artifact(output_dir / "projected_adapters.pt", Path(__file__).resolve().parents[1])
     write_json(output_dir / "metadata.json", metadata)
+    sync_artifact(output_dir / "selection_manifest.json", Path(__file__).resolve().parents[1])
+    sync_artifact(output_dir / "metadata.json", Path(__file__).resolve().parents[1])
+    if (output_dir / "remote_checkpoints.json").exists():
+        # The private remote copy retains optimizer/scaler/RNG recovery state.
+        # Local final weights remain available for evaluation and diagnostics.
+        (output_dir / f"checkpoint-{examples_seen}" / "training_state.pt").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
