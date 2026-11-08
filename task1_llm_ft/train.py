@@ -277,10 +277,6 @@ def main() -> None:
         config["dataset_name"], tokenizer, int(config["max_length"]),
         int(config["num_examples"]), output_dir / "selection_manifest.json",
     )
-    if resume_state:
-        current_selection = json.loads((output_dir / "selection_manifest.json").read_text(encoding="utf-8"))["selection_sha256"]
-        if resume_state.get("selection_sha256") != current_selection:
-            raise RuntimeError("Resume selection differs from the recovery checkpoint")
     reference_manifest = output_dir.parent / "full_ft" / "selection_manifest.json"
     if config["method"] != "full_ft" and not str(config["method"]).startswith("smoke_"):
         if not reference_manifest.exists():
@@ -330,6 +326,9 @@ def main() -> None:
         )
         optimizer.load_state_dict(resume_state["optimizer"])
         scaler.load_state_dict(resume_state["scaler"])
+        current_selection = json.loads((output_dir / "selection_manifest.json").read_text(encoding="utf-8"))["selection_sha256"]
+        if resume_state.get("selection_sha256") != current_selection:
+            raise RuntimeError("Resume selection differs from the recovery checkpoint")
         # Restore RNG after constructing/skipping the DataLoader iterator below;
         # iterator construction itself consumes a Torch RNG draw.
         log_path = output_dir / "train.jsonl"
