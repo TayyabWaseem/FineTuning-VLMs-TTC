@@ -2,8 +2,8 @@
 *.ipynb
 JOURNAL.md
 !README.md
+!task1_kaggle.ipynb
 TASK1_SMOKE_TEST.md
-task1_kaggle.ipynb
 task1_smoke_test.ipynb
 __pycache__/
 *.py[cod]
