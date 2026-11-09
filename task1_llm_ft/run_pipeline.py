@@ -10,8 +10,10 @@ from pathlib import Path
 
 try:
     from .remote import require_remote, restore_artifacts, restore_evaluation_checkpoint, sync_artifact
+    from .analyze import OUTPUTS
 except ImportError:
     from remote import require_remote, restore_artifacts, restore_evaluation_checkpoint, sync_artifact
+    from analyze import OUTPUTS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,14 +85,31 @@ def evaluate(condition: str) -> None:
 
 def diagnostics(condition: str) -> None:
     output = RESULTS / f"diagnostics_{condition}.json"
-    restore_artifacts(ROOT, [f"results/task1/diagnostics_{condition}.json"])
-    if valid_json(output):
-        print(f"{condition}: diagnostics already present")
-        return
+    cache = RESULTS / "probe_cache.pt"
+    restore_artifacts(ROOT, [f"results/task1/diagnostics_{condition}.json",
+                             "results/task1/probe_cache.pt", "results/task1/probe_cache.ids.json"])
+    if not cache.exists():
+        raise RuntimeError("Shared probe cache is missing; run prepare-probes before evaluations")
+    if valid_json(output) and valid_json(cache.with_suffix(".ids.json")):
+        prior = json.loads(output.read_text(encoding="utf-8"))
+        probe_ids = json.loads(cache.with_suffix(".ids.json").read_text(encoding="utf-8"))
+        if (prior.get("probe_ids") == probe_ids.get("probe_ids")
+                and prior.get("starting_weight_sha256") == probe_ids.get("starting_weight_sha256")
+                and all(len(prior.get("activation", {}).get(kind, [])) == 96 for kind in ("math", "non_math"))):
+            print(f"{condition}: diagnostics already present")
+            return
     method = METHOD[condition]
     run("diagnostics", "--config", CONFIG / f"{method}.yaml",
-        "--checkpoint", checkpoint(condition), "--output", output)
+        "--checkpoint", checkpoint(condition), "--output", output, "--cache", cache)
     sync_artifact(output, ROOT)
+
+
+def prepare_probes() -> None:
+    cache = RESULTS / "probe_cache.pt"
+    restore_artifacts(ROOT, ["results/task1/probe_cache.pt", "results/task1/probe_cache.ids.json"])
+    run("diagnostics", "--config", CONFIG / "full_ft.yaml", "--prepare-only", "--cache", cache)
+    sync_artifact(cache, ROOT)
+    sync_artifact(cache.with_suffix(".ids.json"), ROOT)
 
 
 def qualitative() -> None:
@@ -117,28 +136,22 @@ def analyze() -> None:
         "results/task1/qualitative.json", "results/task1/*/metadata.json",
         "results/task1/*/train.jsonl",
     ])
-    args = ["--loss"] + [f"{name}={RESULTS / name / 'train.jsonl'}" for name in METHOD if name != "full_ft_mid"]
-    args += ["--loss-plot", str(RESULTS / "sft_loss.png"), "--benchmarks"]
-    args += [f"{name}={RESULTS / f'eval_{name}.json'}" for name in CONDITIONS]
-    args += ["--benchmark-csv", str(RESULTS / "benchmark_results.csv"), "--resources"]
-    args += [f"{name}={RESULTS / name}" for name in METHOD if name != "full_ft_mid"]
-    args += ["--resource-csv", str(RESULTS / "resources.csv"), "--diagnostics"]
-    args += [f"{name}={RESULTS / f'diagnostics_{name}.json'}" for name in DIAGNOSTICS]
-    args += ["--diagnostic-csv", str(RESULTS / "diagnostics.csv")]
-    run("analyze", *args)
-    for name in ("sft_loss.png", "benchmark_results.csv", "resources.csv", "diagnostics.csv"):
+    run("analyze", "--root", RESULTS)
+    for name in OUTPUTS:
         sync_artifact(RESULTS / name, ROOT)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("stage", choices=("merge", "evaluate", "diagnostics", "qualitative", "analyze"))
+    parser.add_argument("stage", choices=("prepare-probes", "merge", "evaluate", "diagnostics", "qualitative", "analyze"))
     parser.add_argument("--condition", choices=CONDITIONS)
     args = parser.parse_args()
     require_remote()
     if args.stage in ("merge", "evaluate", "diagnostics") and not args.condition:
         parser.error("--condition is required")
-    if args.stage == "merge":
+    if args.stage == "prepare-probes":
+        prepare_probes()
+    elif args.stage == "merge":
         if args.condition not in ADAPTERS:
             parser.error("merge requires an adapter condition")
         merged(args.condition)

@@ -108,6 +108,9 @@ def save_checkpoint(
     adapter_stats: dict[str, Any] | None = None,
     elapsed_seconds: float = 0.0,
     peak_gpu_memory_bytes: int | None = None,
+    l2_sp_pass_seconds: float = 0.0,
+    displacement_l2: float | None = None,
+    midpoint_displacement_l2: float | None = None,
 ) -> None:
     checkpoint_dir = output_dir / f"checkpoint-{examples_seen}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +146,8 @@ def save_checkpoint(
             "adapter_stats": adapter_stats,
             "elapsed_seconds": elapsed_seconds,
             "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+            "l2_sp_pass_seconds": l2_sp_pass_seconds,
+            "midpoint_displacement_l2": midpoint_displacement_l2,
             "selection_sha256": json.loads(
                 (output_dir / "selection_manifest.json").read_text(encoding="utf-8")
             )["selection_sha256"],
@@ -166,6 +171,7 @@ def save_checkpoint(
             "examples_seen": examples_seen,
             "update": update,
             "checkpoint_size_bytes": directory_size(checkpoint_dir),
+            "parameter_displacement_l2": displacement_l2,
         },
     )
     sync_checkpoint(checkpoint_dir, output_dir)
@@ -349,6 +355,8 @@ def main() -> None:
     started = time.perf_counter()
     previous_elapsed = float(resume_state.get("elapsed_seconds", 0.0)) if resume_state else 0.0
     previous_peak = int(resume_state.get("peak_gpu_memory_bytes") or 0) if resume_state else 0
+    l2_sp_pass_seconds = float(resume_state.get("l2_sp_pass_seconds", 0.0)) if resume_state else 0.0
+    midpoint_displacement = resume_state.get("midpoint_displacement_l2") if resume_state else None
     effective_adapter_stats = (
         resume_state.get("adapter_stats") if resume_state and resume_state.get("adapter_stats")
         else adapter_stats.__dict__ if adapter_stats else None
@@ -394,10 +402,17 @@ def main() -> None:
             accumulated_sft_sum += sft_sum.detach().float().item()
 
         scaler.unscale_(optimizer)
+        if config["l2_sp_lambda"] and device.type == "cuda":
+            torch.cuda.synchronize()
+        penalty_started = time.perf_counter()
         penalty = (
             add_l2_sp_gradients(model, reference, float(config["l2_sp_lambda"]))
             if config["l2_sp_lambda"] else torch.zeros((), device=device)
         )
+        if config["l2_sp_lambda"] and device.type == "cuda":
+            torch.cuda.synchronize()
+        l2_sp_update_seconds = time.perf_counter() - penalty_started if config["l2_sp_lambda"] else 0.0
+        l2_sp_pass_seconds += l2_sp_update_seconds
         accumulated_penalty = penalty.detach()
         adapter_grad_max = max(
             (
@@ -428,6 +443,7 @@ def main() -> None:
                 "sft_loss": accumulated_sft_sum / max(1, total_tokens),
                 "l2_sp_omega": accumulated_penalty.float().item(),
                 "l2_sp_term": float(config["l2_sp_lambda"]) * accumulated_penalty.float().item(),
+                "l2_sp_pass_seconds": l2_sp_update_seconds,
                 "total_loss": accumulated_sft_sum / max(1, total_tokens)
                 + float(config["l2_sp_lambda"]) * accumulated_penalty.float().item(),
                 "learning_rate": current_lr,
@@ -450,11 +466,16 @@ def main() -> None:
                 for module in model.modules() if isinstance(module, ProjectedLoRALinear)
             ):
                 raise RuntimeError(f"Adapter correction is still zero at checkpoint {examples_seen}")
+            if config["method"] == "full_ft" and examples_seen == 20000:
+                midpoint_displacement = parameter_displacement(model, reference)
             save_checkpoint(
                 model, tokenizer, optimizer, scaler, output_dir, examples_seen, update, config,
                 effective_adapter_stats,
                 previous_elapsed + time.perf_counter() - started,
                 max(previous_peak, torch.cuda.max_memory_allocated()) if device.type == "cuda" else None,
+                l2_sp_pass_seconds,
+                midpoint_displacement if examples_seen == 20000 else None,
+                midpoint_displacement,
             )
 
     elapsed = previous_elapsed + time.perf_counter() - started
@@ -476,9 +497,16 @@ def main() -> None:
         "reference_storage_bytes": sum(value.numel() * value.element_size() for value in reference.values())
         if config["l2_sp_lambda"]
         else 0,
+        "reference_penalty_pass_seconds": l2_sp_pass_seconds,
+        "reference_transfer_bytes_estimate": (
+            sum(value.numel() * value.element_size() for value in reference.values()) * update
+            if config["l2_sp_lambda"] else 0
+        ),
         "final_parameter_displacement_l2": parameter_displacement(model, reference)
         if not is_adapter_run
         else None,
+        "midpoint_parameter_displacement_l2": midpoint_displacement
+        if config["method"] == "full_ft" else None,
         "checkpoint_sizes_bytes": {
             path.name: directory_size(path)
             for path in output_dir.glob("checkpoint-*")
@@ -490,7 +518,13 @@ def main() -> None:
         } if (output_dir / "remote_checkpoints.json").exists() else {},
     }
     if adapter_stats:
-        torch.save(export_projected_adapters(model), output_dir / "projected_adapters.pt")
+        exported = export_projected_adapters(model)
+        metadata["adapter_export_seconds"] = exported["_metadata"]["export_seconds"]
+        metadata["protected_basis_storage_bytes"] = (
+            effective_adapter_stats["protected_basis_parameters"] * 4
+            if effective_adapter_stats else 0
+        )
+        torch.save(exported, output_dir / "projected_adapters.pt")
         sync_artifact(output_dir / "projected_adapters.pt", Path(__file__).resolve().parents[1])
     write_json(output_dir / "metadata.json", metadata)
     sync_artifact(output_dir / "selection_manifest.json", Path(__file__).resolve().parents[1])

@@ -112,6 +112,7 @@ def run_evaluation(
         raw = _first_text(row.get("resps"))
         extracted = _first_text(row.get("filtered_resps"))
         unextractable = extracted in ("", "[invalid]", "[INVALID]")
+        retokenized_tokens = len(lm.tokenizer(raw, add_special_tokens=False)["input_ids"])
         gsm_rows.append({
             "doc_id": row.get("doc_id"),
             "question": row.get("doc", {}).get("question"),
@@ -119,7 +120,9 @@ def run_evaluation(
             "raw_response": raw,
             "extracted_answer": None if unextractable else extracted,
             "unextractable": unextractable,
-            "truncated": len(lm.tokenizer(raw, add_special_tokens=False)["input_ids"]) >= 1024,
+            "truncated": retokenized_tokens >= 1024,
+            "response_tokens_retokenized": retokenized_tokens,
+            "truncation_flag_basis": "retokenized response length >= 1024; approximate at boundary",
             "correct": row.get("exact_match"),
         })
     if "gsm8k_cot" in chosen:
