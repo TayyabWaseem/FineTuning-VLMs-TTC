@@ -37,6 +37,7 @@ class RemotePathTest(unittest.TestCase):
             checkpoint.mkdir(parents=True)
             (checkpoint / "training_state.pt").write_bytes(b"state")
             (checkpoint / "run_config.json").write_text("{}")
+            (checkpoint / "model.safetensors").write_bytes(b"weights")
             (output / "train.jsonl").write_text("{}\n")
             api = FakeApi()
             with patch.object(remote, "PROJECT_ROOT", root), patch.object(

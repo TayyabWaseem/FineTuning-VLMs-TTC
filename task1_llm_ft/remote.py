@@ -49,9 +49,14 @@ def sync_checkpoint(checkpoint_dir: Path, output_dir: Path) -> None:
         commit_message=f"{method} {checkpoint_dir.name} recovery checkpoint",
     )
     remote_files = set(api.list_repo_files(repo_id, repo_type="dataset"))
-    for required in ("training_state.pt", "run_config.json"):
-        if f"{path_in_repo}/{required}" not in remote_files:
-            raise RuntimeError(f"Remote checkpoint incomplete: {path_in_repo}/{required}")
+    required = ["training_state.pt", "run_config.json"]
+    required.append(
+        "adapter_model.safetensors" if (checkpoint_dir / "adapter_model.safetensors").exists()
+        else "model.safetensors"
+    )
+    for filename in required:
+        if f"{path_in_repo}/{filename}" not in remote_files:
+            raise RuntimeError(f"Remote checkpoint incomplete: {path_in_repo}/{filename}")
     log_path = output_dir / "train.jsonl"
     api.upload_file(
         repo_id=repo_id,
@@ -106,11 +111,23 @@ def restore_latest(output_dir: Path) -> Path | None:
     method = output_dir.name
     paths = api.list_repo_files(repo_id, repo_type="dataset")
     prefix = f"{REMOTE_ROOT}/{method}/checkpoint-"
+    snapshot_download(
+        repo_id=repo_id, repo_type="dataset", token=token,
+        local_dir=str(PROJECT_ROOT),
+        allow_patterns=[f"{REMOTE_ROOT}/{method}/remote_checkpoints.json"],
+    )
+    index_path = output_dir / "remote_checkpoints.json"
+    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {}
     counts = sorted(
         int(path[len(prefix):].split("/")[0])
         for path in paths
         if path.startswith(prefix) and path.endswith("/training_state.pt")
         and path[len(prefix):].split("/")[0].isdigit()
+        and index.get(f"checkpoint-{path[len(prefix):].split('/')[0]}", {}).get("verified")
+        and (
+            f"{prefix}{path[len(prefix):].split('/')[0]}/adapter_model.safetensors" in paths
+            or f"{prefix}{path[len(prefix):].split('/')[0]}/model.safetensors" in paths
+        )
     )
     if not counts:
         return None
@@ -123,8 +140,12 @@ def restore_latest(output_dir: Path) -> Path | None:
         allow_patterns=[f"{REMOTE_ROOT}/{method}/{latest}/*", f"{REMOTE_ROOT}/{method}/train.jsonl", f"{REMOTE_ROOT}/{method}/remote_checkpoints.json", f"{REMOTE_ROOT}/{method}/metadata.json"],
     )
     checkpoint = output_dir / latest
-    if not (checkpoint / "training_state.pt").is_file():
-        raise RuntimeError(f"Downloaded checkpoint is incomplete: {checkpoint}")
+    required = ["training_state.pt", "run_config.json"]
+    required.append("adapter_model.safetensors" if (checkpoint / "adapter_model.safetensors").exists()
+                    else "model.safetensors")
+    missing = [name for name in required if not (checkpoint / name).is_file()]
+    if missing:
+        raise RuntimeError(f"Downloaded checkpoint is incomplete at {checkpoint}; missing {missing}")
     return checkpoint
 
 
