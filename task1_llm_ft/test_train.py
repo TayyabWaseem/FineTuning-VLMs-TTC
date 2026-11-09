@@ -13,11 +13,34 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from .train import add_l2_sp_gradients, l2_sp_penalty
+from .train import add_l2_sp_gradients, l2_sp_penalty, memory_efficient_sft_loss, shift_loss
 from . import train as train_module
 
 
 class L2SPGradientTest(unittest.TestCase):
+    def test_chunked_loss_matches_dense_loss_and_gradients(self) -> None:
+        class Backbone(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = nn.Embedding(11, 5)
+            def forward(self, input_ids, **_kwargs):
+                return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+        model = nn.Module()
+        model.model = Backbone()
+        model.lm_head = nn.Linear(5, 11, bias=False)
+        batch = {"input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0]]),
+                 "attention_mask": torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]]),
+                 "labels": torch.tensor([[-100, -100, 3, 4], [-100, 6, 7, -100]])}
+        dense, _ = shift_loss(model.lm_head(model.model(**batch).last_hidden_state), batch["labels"])
+        dense.backward()
+        expected = [p.grad.clone() for p in model.parameters()]
+        model.zero_grad()
+        chunked = memory_efficient_sft_loss(model, batch, chunk_size=2)
+        chunked.backward()
+        self.assertTrue(torch.allclose(dense, chunked, atol=1e-6))
+        for parameter, gradient in zip(model.parameters(), expected):
+            self.assertTrue(torch.allclose(parameter.grad, gradient, atol=1e-6))
+
     def test_gradient_matches_lambda_times_displacement(self) -> None:
         model = nn.Linear(2, 1, bias=False)
         with torch.no_grad():

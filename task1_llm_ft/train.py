@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 from torch.amp import GradScaler
 from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
@@ -56,15 +57,17 @@ def add_l2_sp_gradients(
     for name, parameter in model.named_parameters():
         if name not in reference:
             continue
-        reference_value = reference[name].to(device=parameter.device, dtype=torch.float32)
-        displacement = parameter.detach().float() - reference_value
-        penalty += 0.5 * displacement.square().sum()
-        penalty_gradient = coefficient * displacement
-        penalty_gradient = penalty_gradient.to(dtype=parameter.dtype)
         if parameter.grad is None:
-            parameter.grad = penalty_gradient
-        else:
-            parameter.grad.add_(penalty_gradient)
+            parameter.grad = torch.zeros_like(parameter)
+        flat_parameter = parameter.detach().view(-1)
+        flat_reference = reference[name].view(-1)
+        flat_gradient = parameter.grad.view(-1)
+        for start in range(0, flat_parameter.numel(), 1_000_000):
+            end = min(start + 1_000_000, flat_parameter.numel())
+            reference_value = flat_reference[start:end].to(device=parameter.device, dtype=torch.float32)
+            displacement = flat_parameter[start:end].float() - reference_value
+            penalty += 0.5 * displacement.square().sum()
+            flat_gradient[start:end].add_(displacement.to(dtype=parameter.dtype), alpha=coefficient)
     return penalty
 
 
@@ -78,6 +81,23 @@ def shift_loss(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor
         reduction="sum",
     )
     return loss_sum, valid_tokens
+
+
+def memory_efficient_sft_loss(model: torch.nn.Module, batch: dict[str, torch.Tensor], chunk_size: int = 128) -> torch.Tensor:
+    """Compute the same summed causal loss without a full sequence-by-vocabulary tensor."""
+    hidden = model.model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False).last_hidden_state
+    labels = batch["labels"][:, 1:].reshape(-1)
+    hidden = hidden[:, :-1, :].reshape(-1, hidden.shape[-1])
+    valid = labels != -100
+    hidden, labels = hidden[valid], labels[valid]
+    if not labels.numel():
+        return hidden.sum() * 0
+
+    def chunk_loss(states: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(model.lm_head(states).float(), targets, reduction="sum")
+
+    return sum(checkpoint(chunk_loss, states, targets, use_reentrant=False)
+               for states, targets in zip(hidden.split(chunk_size), labels.split(chunk_size)))
 
 
 def parameter_displacement(
@@ -319,6 +339,7 @@ def main() -> None:
         lr=float(config["learning_rate"]),
         betas=(0.9, 0.999),
         eps=1e-8,
+        foreach=False,
     )
     # FP16 backbone gradients can overflow at the default 65536 scale before
     # a two-step smoke run has enough updates to recover.
@@ -396,10 +417,14 @@ def main() -> None:
             with torch.autocast(
                 device_type="cuda", dtype=torch.float16, enabled=device.type == "cuda"
             ):
-                outputs = model(**batch)
-                sft_sum, _ = shift_loss(outputs.logits, batch["labels"])
+                if hasattr(model, "model") and hasattr(model, "lm_head"):
+                    sft_sum = memory_efficient_sft_loss(model, batch)
+                else:
+                    outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
+                    sft_sum, _ = shift_loss(outputs.logits, batch["labels"])
             scaler.scale(sft_sum / max(1, total_tokens)).backward()
             accumulated_sft_sum += sft_sum.detach().float().item()
+            del sft_sum
 
         scaler.unscale_(optimizer)
         if config["l2_sp_lambda"] and device.type == "cuda":
@@ -425,7 +450,7 @@ def main() -> None:
         adapter_grad_count = sum(
             parameter.grad is not None for _, parameter in adapter_parameters
         )
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]))
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["max_grad_norm"]), foreach=False)
         current_lr = cosine_lr(update, updates, int(config["warmup_updates"]), float(config["learning_rate"]))
         for group in optimizer.param_groups:
             group["lr"] = current_lr
