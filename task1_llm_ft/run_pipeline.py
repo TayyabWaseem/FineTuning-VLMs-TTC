@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -11,9 +12,11 @@ from pathlib import Path
 try:
     from .remote import require_remote, restore_artifacts, restore_evaluation_checkpoint, sync_artifact
     from .analyze import OUTPUTS
+    from .utils import write_json
 except ImportError:
     from remote import require_remote, restore_artifacts, restore_evaluation_checkpoint, sync_artifact
     from analyze import OUTPUTS
+    from utils import write_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +25,7 @@ CONFIG = ROOT / "task1_llm_ft/configs"
 ADAPTERS = ("lora4", "lora16", "op_lora16")
 CONDITIONS = ("baseline", "full_ft_mid", "full_ft", "full_ft_l2sp", *ADAPTERS)
 DIAGNOSTICS = CONDITIONS[1:]
+TASKS = ("gsm8k_cot", "hellaswag", "boolq", "arc_easy")
 METHOD = {name: name for name in CONDITIONS if name != "baseline"}
 METHOD["full_ft_mid"] = "full_ft"
 COUNT = {"full_ft_mid": 20000, **{name: 40000 for name in CONDITIONS if name not in ("baseline", "full_ft_mid")}}
@@ -69,15 +73,39 @@ def evaluate(condition: str) -> None:
         f"results/task1/eval_{condition}.json",
         f"results/task1/eval_{condition}.samples.json",
         f"results/task1/eval_{condition}.gsm8k_examples.json",
+        f"results/task1/eval_{condition}.*.json",
     ])
-    if all(valid_json(path) for path in (output, samples, gsm_examples)):
+    if (all(valid_json(path) for path in (output, samples, gsm_examples))
+            and set(json.loads(output.read_text(encoding="utf-8")).get("results", {})) == set(TASKS)
+            and len(json.loads(gsm_examples.read_text(encoding="utf-8"))) == 1319):
         print(f"{condition}: evaluation already present")
         return
     model_path = merged(condition) if condition in ADAPTERS else checkpoint(condition)
-    run("evaluate", "--model-path", model_path, "--output", output, "--batch-size", "1")
-    result = json.loads(output.read_text(encoding="utf-8"))
-    if set(result.get("results", {})) != {"gsm8k_cot", "hellaswag", "boolq", "arc_easy"}:
-        raise RuntimeError(f"{condition}: incomplete benchmark results")
+    parts = []
+    for task in TASKS:
+        part = RESULTS / f"eval_{condition}.{task}.json"
+        part_samples = part.with_suffix(".samples.json")
+        part_gsm = part.with_suffix(".gsm8k_examples.json")
+        expected_files = (part, part_samples, part_gsm) if task == "gsm8k_cot" else (part, part_samples)
+        if not all(valid_json(path) for path in expected_files):
+            run("evaluate", "--model-path", model_path, "--output", part,
+                "--batch-size", "1", "--tasks", task)
+            if not all(valid_json(path) for path in expected_files):
+                raise RuntimeError(f"{condition}/{task}: evaluation artifacts are incomplete")
+            for path in expected_files:
+                sync_artifact(path, ROOT)
+        part_result = json.loads(part.read_text(encoding="utf-8"))
+        if set(part_result.get("results", {})) != {task}:
+            raise RuntimeError(f"{condition}/{task}: missing task result")
+        parts.append(part_result)
+    combined = {key: {} for key in ("results", "samples", "versions", "configs")}
+    for part_result in parts:
+        for key in combined:
+            combined[key].update(part_result.get(key, {}))
+    combined["evaluation_settings"] = {**parts[0]["evaluation_settings"], "tasks": list(TASKS)}
+    write_json(output, combined)
+    write_json(samples, combined["samples"])
+    shutil.copyfile(RESULTS / f"eval_{condition}.gsm8k_cot.gsm8k_examples.json", gsm_examples)
     sync_artifact(output, ROOT)
     sync_artifact(samples, ROOT)
     sync_artifact(gsm_examples, ROOT)
