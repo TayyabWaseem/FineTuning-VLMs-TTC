@@ -35,6 +35,11 @@ def require_remote() -> None:
 
 
 def sync_checkpoint(checkpoint_dir: Path, output_dir: Path) -> None:
+    relative_output = output_dir.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    if relative_output.startswith("results/task1_smoke/"):
+        # Keep smoke checkpoints local: the smoke suite intentionally resumes
+        # from an earlier boundary and checks each recovery file afterward.
+        return
     client = _client()
     if client is None:
         return

@@ -29,6 +29,18 @@ class FakeApi:
 
 
 class RemotePathTest(unittest.TestCase):
+    def test_smoke_checkpoints_stay_local_for_resume_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "results/task1_smoke/full_ft"
+            checkpoint = output / "checkpoint-4"
+            checkpoint.mkdir(parents=True)
+            with patch.object(remote, "PROJECT_ROOT", root), patch.object(
+                remote, "_client", side_effect=AssertionError("smoke must not upload checkpoints")
+            ):
+                remote.sync_checkpoint(checkpoint, output)
+            self.assertTrue(checkpoint.is_dir())
+
     def test_checkpoint_and_progress_use_one_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
