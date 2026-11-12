@@ -27,17 +27,29 @@ def assemble_batch(embedding: nn.Module, connector: VisualConnector, examples: l
     196x768 feature tensor or None. None removes visual tokens entirely.
     """
     device = next(embedding.parameters()).device
+    visual_by_index = {}
+    groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    for index, row in enumerate(examples):
+        if row.get("features") is not None:
+            feature = torch.as_tensor(row["features"])
+            if feature.ndim != 2 or feature.shape[-1] != 768 or feature.shape[0] not in (49, 196):
+                raise ValueError("Each image requires 196 (or 49) x 768 features")
+            groups.setdefault(feature.shape[0], []).append((index, feature))
+    for group in groups.values():
+        patches = torch.stack([feature for _, feature in group]).to(device=device, dtype=torch.float32)
+        projected = connector(patches)
+        for offset, (index, _) in enumerate(group):
+            visual_by_index[index] = projected[offset]
     vectors, targets = [], []
-    for row in examples:
+    for row_index, row in enumerate(examples):
         ids = torch.as_tensor(row["input_ids"], dtype=torch.long, device=device)
         labels = torch.as_tensor(row["labels"], dtype=torch.long, device=device)
         index = int(row["visual_insert_index"])
         if ids.ndim != 1 or ids.shape != labels.shape or not 0 <= index <= ids.numel():
             raise ValueError("Invalid text tokens, labels, or visual insertion index")
         text = embedding(ids)
-        features = row.get("features")
-        if features is not None:
-            visual = connector(torch.as_tensor(features, device=device).unsqueeze(0)).squeeze(0).to(text.dtype)
+        if row_index in visual_by_index:
+            visual = visual_by_index[row_index].to(text.dtype)
             vectors.append(torch.cat([text[:index], visual, text[index:]], dim=0))
             targets.append(torch.cat([labels[:index], labels.new_full((visual.shape[0],), -100), labels[index:]]))
         else:
@@ -61,15 +73,13 @@ def example_weighted_loss(hidden: torch.Tensor, labels: torch.Tensor, lm_head: n
     """Average response-token CE within each example, then across examples."""
     targets = labels[:, 1:]
     features = hidden[:, :-1, :]
-    losses = []
-    for states, truth in zip(features, targets):
-        keep = truth != -100
-        states, truth = states[keep], truth[keep]
-        if not truth.numel():
-            raise ValueError("Each example must have at least one supervised token")
-        def part(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            return F.cross_entropy(lm_head(x).float(), y, reduction="sum")
-        summed = sum(checkpoint(part, x, y, use_reentrant=False)
-                     for x, y in zip(states.split(chunk_size), truth.split(chunk_size)))
-        losses.append(summed / truth.numel())
-    return torch.stack(losses).mean()
+    keep = targets != -100
+    counts = keep.sum(dim=1)
+    if torch.any(counts == 0):
+        raise ValueError("Each example must have at least one supervised token")
+    weights = (1.0 / (counts.float() * targets.shape[0])).unsqueeze(1).expand_as(targets)[keep]
+    states, truth = features[keep], targets[keep]
+    def part(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        return (F.cross_entropy(lm_head(x).float(), y, reduction="none") * w).sum()
+    return sum(checkpoint(part, x, y, w, use_reentrant=False)
+               for x, y, w in zip(states.split(chunk_size), truth.split(chunk_size), weights.split(chunk_size)))

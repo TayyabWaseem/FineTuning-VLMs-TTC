@@ -7,6 +7,17 @@ from .interface import VisualConnector, assemble_batch, example_weighted_loss
 
 
 class InterfaceTest(unittest.TestCase):
+    def test_batched_connector_matches_individual_images(self):
+        embedding = nn.Embedding(10, 1024)
+        connector = VisualConnector()
+        features = [torch.randn(196, 768), torch.randn(196, 768)]
+        rows = [{"input_ids": [1, 2], "labels": [-100, 2], "visual_insert_index": 1, "features": value}
+                for value in features]
+        batch = assemble_batch(embedding, connector, rows)
+        for index, value in enumerate(features):
+            expected = connector(value.unsqueeze(0)).squeeze(0)
+            self.assertTrue(torch.allclose(batch["inputs_embeds"][index, 1:197], expected, atol=1e-6))
+
     def test_visual_insertion_masks_positions_and_gradients(self):
         embedding = nn.Embedding(20, 1024)
         embedding.requires_grad_(False)
@@ -38,6 +49,24 @@ class InterfaceTest(unittest.TestCase):
         first = torch.nn.functional.cross_entropy(head(hidden[0, :1]), torch.tensor([0]))
         second = torch.nn.functional.cross_entropy(head(hidden[1, :2]), torch.tensor([0, 1]))
         self.assertTrue(torch.allclose(computed, (first + second) / 2))
+
+    def test_batched_chunked_loss_preserves_dense_gradients(self):
+        torch.manual_seed(7)
+        hidden = torch.randn(3, 6, 5, requires_grad=True)
+        labels = torch.tensor([[-100, -100, 1, 2, 3, -100], [-100, 4, -100, -100, -100, -100],
+                               [-100, 2, 0, 1, 4, 3]])
+        head = nn.Linear(5, 6)
+        dense = torch.stack([torch.nn.functional.cross_entropy(head(h[:-1]).float(), y[1:], ignore_index=-100)
+                             for h, y in zip(hidden, labels)]).mean()
+        dense.backward()
+        expected_hidden, expected_head = hidden.grad.clone(), head.weight.grad.clone()
+        hidden.grad = None
+        head.zero_grad()
+        chunked = example_weighted_loss(hidden, labels, head, chunk_size=3)
+        chunked.backward()
+        self.assertTrue(torch.allclose(chunked, dense, atol=1e-6))
+        self.assertTrue(torch.allclose(hidden.grad, expected_hidden, atol=1e-6))
+        self.assertTrue(torch.allclose(head.weight.grad, expected_head, atol=1e-6))
 
 
 if __name__ == "__main__":

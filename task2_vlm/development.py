@@ -23,12 +23,19 @@ def per_example_nll(model, tokenizer, features, examples: list[dict], image_ids:
         with torch.autocast("cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
             batch = model.batch(prepared)
             hidden = model.hidden(batch)
-            for states, labels in zip(hidden[:, :-1], batch["labels"][:, 1:]):
-                valid = labels != -100
-                if not valid.any():
-                    raise RuntimeError("No development target tokens")
-                logits = model.backbone.lm_head(states[valid]).float()
-                values.append(float(F.cross_entropy(logits, labels[valid], reduction="mean")))
+            labels = batch["labels"][:, 1:]
+            valid = labels != -100
+            counts = valid.sum(dim=1)
+            if torch.any(counts == 0):
+                raise RuntimeError("No development target tokens")
+            states = hidden[:, :-1][valid]
+            targets = labels[valid]
+            owners = torch.arange(len(rows), device=labels.device).unsqueeze(1).expand_as(labels)[valid]
+            sums = torch.zeros(len(rows), device=labels.device, dtype=torch.float32)
+            for xs, ys, sample_ids in zip(states.split(128), targets.split(128), owners.split(128)):
+                losses = F.cross_entropy(model.backbone.lm_head(xs).float(), ys, reduction="none")
+                sums.scatter_add_(0, sample_ids, losses)
+            values.extend((sums / counts).cpu().tolist())
     return values
 
 
