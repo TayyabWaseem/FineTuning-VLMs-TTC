@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -16,6 +17,26 @@ def load(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def preparation_hash() -> str:
+    digest = hashlib.sha256()
+    for name in ("normalize.py", "selection.py", "prepare.py"):
+        path = Path(__file__).resolve().parent / name
+        digest.update(name.encode()); digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def source_hashes(root: Path) -> dict[str, str]:
+    from .download import NEEDED
+    result = {}
+    for name in sorted(NEEDED):
+        digest = hashlib.sha256()
+        with (root / name).open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        result[name] = digest.hexdigest()
+    return result
+
+
 def images_in_pairs(pairs: list[dict]) -> set[int]:
     return {int(example["image_id"]) for pair in pairs for example in pair["examples"]}
 
@@ -24,7 +45,9 @@ def mismatched_map(pairs: list[dict], rng: np.random.Generator) -> dict[str, lis
     result = {}
     for pair in pairs:
         own = {item["image_id"] for item in pair["examples"]}
+        question = " ".join(pair["examples"][0]["question"].casefold().split())
         candidates = sorted({item["image_id"] for other in pairs if other["pair_id"] != pair["pair_id"]
+                             and " ".join(other["examples"][0]["question"].casefold().split()) != question
                              for item in other["examples"] if item["image_id"] not in own})
         if not candidates:
             raise ValueError(f"No eligible mismatched image for {pair['pair_id']}")
@@ -34,10 +57,12 @@ def mismatched_map(pairs: list[dict], rng: np.random.Generator) -> dict[str, lis
 
 def prepare(root: Path, output: Path, image_dir: Path) -> None:
     rng = np.random.default_rng(6304)
+    print("Loading COCO captions and instance annotations", flush=True)
     coco_train = load(root / "captions_train2014.json")
     coco_val = load(root / "captions_val2014.json")
     instance_train = load(root / "instances_train2014.json")
     instance_val = load(root / "instances_val2014.json")
+    print("Loading VQAv2 questions, answers, and complementary pairs", flush=True)
     train_q = load(root / "v2_OpenEnded_mscoco_train2014_questions.json")["questions"]
     val_q = load(root / "v2_OpenEnded_mscoco_val2014_questions.json")["questions"]
     train_a = load(root / "v2_mscoco_train2014_annotations.json")["annotations"]
@@ -46,6 +71,7 @@ def prepare(root: Path, output: Path, image_dir: Path) -> None:
     val_pairs = load(root / "v2_mscoco_val2014_complementary_pairs.json")
     natural = select_natural_splits(natural_candidates(train_q, train_a, train_pairs, normalize_answer),
                                     natural_candidates(val_q, val_a, val_pairs, normalize_answer))
+    print("Selected natural VQA train/development/test pairs", flush=True)
     train_ids = {int(row["id"]) for row in coco_train["images"]}
     val_ids = {int(row["id"]) for row in coco_val["images"]}
     train_captions = select_captions(coco_train["annotations"], train_ids, 6000, 3, rng)
@@ -61,7 +87,9 @@ def prepare(root: Path, output: Path, image_dir: Path) -> None:
     assert_split_isolation({"natural_dev": natural_dev, "natural_test": natural_test,
                             "caption_dev": caption_dev_ids, "ground_dev": ground_dev_ids,
                             "ground_test": ground_test_ids, "train": train_ids})
+    print("Generating annotation-derived training grounding pairs", flush=True)
     train_ground = grounding_pools(train_caption_ids, instance_train["annotations"], instance_train["categories"], rng)
+    print("Generating annotation-derived development and test grounding pairs", flush=True)
     dev_ground = grounding_pools(ground_dev_ids, instance_val["annotations"], instance_val["categories"], rng, 12)
     test_ground = grounding_pools(ground_test_ids, instance_val["annotations"], instance_val["categories"], rng, 32)
     ground_dev = dev_ground["presence"] + dev_ground["counting"]
@@ -69,6 +97,9 @@ def prepare(root: Path, output: Path, image_dir: Path) -> None:
     for row in train_captions + dev_captions:
         row["question"] = "Describe this image."
     manifest = {"seed": 6304, "normalizer": "task2_vlm.normalize.normalize_answer",
+                "preparation_source_sha256": preparation_hash(),
+                "annotation_source_sha256": source_hashes(root),
+                "mismatched_rule": "random image from a different test pair with different question text; excludes original pair images",
                 "train": {"caption": train_captions, "natural": natural["train"], **train_ground},
                 "development": {"caption": dev_captions, "natural": natural["development"], "grounding": ground_dev},
                 "test": {"natural": natural["test"], "grounding": ground_test},

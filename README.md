@@ -46,3 +46,31 @@ writing the report.
   [huggingface_hub](https://huggingface.co/docs/huggingface_hub/guides/upload).
 
 The student is responsible for reviewing and understanding all submitted code.
+
+## Task 2 — vision-language experiment
+
+`task2_kaggle.ipynb` embeds the local Task 2 Python sources and can be uploaded
+directly to Kaggle without pushing this repository. Enable Internet and a GPU,
+and provide the `HF_TOKEN` and `PA3_HF_REPO` Kaggle secrets for a private
+Hugging Face dataset. Its outputs and checkpoint markers are isolated under
+`results/task2/`. Run the GPU smoke before the full experiment. Data selection,
+verified SigLIP feature shards, and training checkpoints are recoverable across
+sessions; training resumes from the last verified 250-update checkpoint.
+
+The notebook prints observed seconds per update; multiply by remaining updates
+to estimate training time and add data preparation, development evaluations,
+final generation and uploads. Total T4 runtime has not been measured. The
+optional 49-token comparison is not included in the main notebook.
+
+Task 2 obtains COCO 2014 captions, instances and images from the
+[COCO dataset](https://cocodataset.org/) and VQAv2 questions, annotations and
+complementary pairs from the [official VQA downloads](https://visualqa.org/download.html).
+SigLIP features use the normalized `last_hidden_state` from
+[Hugging Face's SigLIP implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/siglip/modeling_siglip.py).
+The local answer-normalization rule is applied consistently and documented in
+`task2_vlm/normalize.py`; its contraction table is not the complete official
+VQA normalization table. The VQA leave-one-out consensus formula follows the
+assignment and the [VQA evaluation description](https://visualqa.org/evaluation.html).
+The split treats unannotated COCO objects as absent, so annotation omissions
+may affect presence labels. The notebook saves evidence; report prose and
+interpretation are the student's responsibility.

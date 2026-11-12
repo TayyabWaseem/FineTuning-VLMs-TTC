@@ -19,7 +19,9 @@ def natural_candidates(questions: list[dict], annotations: list[dict], pairs: li
     question_map = {int(item["question_id"]): item for item in questions}
     answer_map = {int(item["question_id"]): item for item in annotations}
     candidates = []
-    for pair in pairs:
+    for position, pair in enumerate(pairs, 1):
+        if position % 20000 == 0:
+            print(f"Filtered {position}/{len(pairs)} VQA pairs; {len(candidates)} eligible", flush=True)
         if len(pair) != 2 or pair[0] == pair[1]:
             continue
         try:

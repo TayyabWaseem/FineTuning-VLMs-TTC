@@ -37,6 +37,8 @@ def _pair_metrics(rows: list[dict], suite: str) -> dict[str, float]:
         "empty_answer_rate": float(np.mean([not p for p in predictions])),
         "reference_nll": float(np.mean([row["reference_nll"] for row in rows])),
         "generation_seconds_per_answer": float(np.mean([row["generation_seconds"] for row in rows])),
+        "partner_answer_rate": float(np.mean([p == row.get("partner_canonical_normalized", "<missing>")
+                                               for p, row in zip(predictions, rows)])),
     }
 
 
